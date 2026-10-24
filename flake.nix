@@ -108,8 +108,9 @@
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             nix-cache = import ./nix/test-nix-cache.nix {
-              inherit pkgs;
+              inherit pkgs system;
               self = inputs.self;
+              inherit (inputs) nisshi masu;
             };
             service = import ./nix/test-service.nix {
               inherit pkgs system;
