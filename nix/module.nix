@@ -12,7 +12,33 @@ let
   settings = lib.recursiveUpdate (
     lib.optionalAttrs (cfg.listen != "127.0.0.1:8080") { server.listen = cfg.listen; }
     // lib.optionalAttrs (cfg.metrics.listen != null) { metrics.listen = cfg.metrics.listen; }
-    // lib.optionalAttrs (cfg.stateDir != "/var/lib/oroshi") { storage.dir = cfg.stateDir; }
+    //
+      lib.optionalAttrs
+        (
+          cfg.stateDir != "/var/lib/oroshi"
+          || cfg.storage.maxBytes != null
+          || cfg.storage.gcTargetRatio != 0.9
+        )
+        {
+          storage =
+            lib.optionalAttrs (cfg.stateDir != "/var/lib/oroshi") { dir = cfg.stateDir; }
+            // lib.optionalAttrs (cfg.storage.maxBytes != null) { max_bytes = cfg.storage.maxBytes; }
+            // lib.optionalAttrs (cfg.storage.gcTargetRatio != 0.9) {
+              gc_target_ratio = cfg.storage.gcTargetRatio;
+            };
+        }
+    // lib.optionalAttrs (cfg.gc.orphanGrace != 3600) { gc.orphan_grace = cfg.gc.orphanGrace; }
+    // lib.optionalAttrs (cfg.retention.days != 30) { retention.days = cfg.retention.days; }
+    // lib.optionalAttrs (cfg.tokens != { }) { tokens = cfg.tokens; }
+    //
+      lib.optionalAttrs
+        (cfg.nix.priority != 30 || cfg.nix.trustedKeys != [ ] || cfg.nix.maxNarBytes != 17179869184)
+        {
+          nix =
+            lib.optionalAttrs (cfg.nix.priority != 30) { priority = cfg.nix.priority; }
+            // lib.optionalAttrs (cfg.nix.trustedKeys != [ ]) { trusted_keys = cfg.nix.trustedKeys; }
+            // lib.optionalAttrs (cfg.nix.maxNarBytes != 17179869184) { max_nar_bytes = cfg.nix.maxNarBytes; };
+        }
     // lib.optionalAttrs (cfg.log.level != "info" || cfg.log.access) {
       log =
         lib.optionalAttrs (cfg.log.level != "info") { level = cfg.log.level; }
@@ -74,6 +100,63 @@ in
         type = types.bool;
         default = false;
         description = "Log successful and not-found reads as well as writes and failures.";
+      };
+    };
+    storage = {
+      maxBytes = mkOption {
+        type = types.nullOr types.ints.unsigned;
+        default = null;
+        description = "Maximum stored blob bytes; null disables the capacity limit.";
+      };
+      gcTargetRatio = mkOption {
+        type = types.float;
+        default = 0.9;
+        description = "Target fraction of the storage capacity after garbage collection.";
+      };
+    };
+    gc.orphanGrace = mkOption {
+      type = types.ints.unsigned;
+      default = 3600;
+      description = "Grace period in seconds before an unreferenced blob can be removed.";
+    };
+    retention.days = mkOption {
+      type = types.ints.unsigned;
+      default = 30;
+      description = "Retention period in days.";
+    };
+    tokens = mkOption {
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            sha256 = mkOption {
+              type = types.str;
+              description = "SHA-256 hash of the token as 64 lowercase hexadecimal characters.";
+            };
+            scopes = mkOption {
+              type = types.listOf types.str;
+              description = "Token scopes, validated by oroshi config check.";
+            };
+          };
+        }
+      );
+      default = { };
+      description = "Named token hashes and scopes; never store plaintext tokens here.";
+    };
+    nix = {
+      priority = mkOption {
+        type = types.ints.unsigned;
+        default = 30;
+        description = "Binary cache priority advertised in nix-cache-info.";
+      };
+      trustedKeys = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Trusted public signing keys in name:base64 format.";
+      };
+      maxNarBytes = mkOption {
+        type = types.ints.unsigned;
+        default = 17179869184;
+        description = "Maximum bytes per NAR upload.";
       };
     };
     settings = mkOption {

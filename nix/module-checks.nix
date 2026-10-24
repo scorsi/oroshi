@@ -27,6 +27,24 @@ let
             listen = "127.0.0.1:8081";
             metrics.listen = "127.1.2.3:9000";
             stateDir = "/var/lib/oroshi-example";
+            storage = {
+              maxBytes = 2048;
+              gcTargetRatio = 0.8;
+            };
+            gc.orphanGrace = 7200;
+            retention.days = 7;
+            tokens.builder = {
+              sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+              scopes = [
+                "nix:write"
+                "nix:pin"
+              ];
+            };
+            nix = {
+              priority = 20;
+              trustedKeys = [ "example.org:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" ];
+              maxNarBytes = 1024;
+            };
             log = {
               level = "debug";
               access = true;
@@ -48,6 +66,18 @@ let
       log = {
         level = lib.mkForce "info";
         access = lib.mkForce false;
+      };
+      storage = {
+        maxBytes = lib.mkForce null;
+        gcTargetRatio = lib.mkForce 0.9;
+      };
+      gc.orphanGrace = lib.mkForce 3600;
+      retention.days = lib.mkForce 30;
+      tokens = lib.mkForce { };
+      nix = {
+        priority = lib.mkForce 30;
+        trustedKeys = lib.mkForce [ ];
+        maxNarBytes = lib.mkForce 17179869184;
       };
       settings = lib.mkForce { };
     };
@@ -134,18 +164,61 @@ in
       (pkgs.formats.toml { }).generate "expected-oroshi.toml" {
         server.listen = "127.0.0.1:8081";
         metrics.listen = "127.1.2.3:9000";
-        storage.dir = "/var/lib/oroshi-example";
+        storage = {
+          dir = "/var/lib/oroshi-example";
+          max_bytes = 2048;
+          gc_target_ratio = 0.8;
+        };
+        gc.orphan_grace = 7200;
+        retention.days = 7;
+        tokens.builder = {
+          sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+          scopes = [
+            "nix:write"
+            "nix:pin"
+          ];
+        };
+        nix = {
+          priority = 20;
+          trusted_keys = [ "example.org:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" ];
+          max_nar_bytes = 1024;
+        };
         log = {
           level = "debug";
           access = true;
         };
       }
     }
-    cmp ${configFile { services.oroshi.settings.log.level = "warn"; }} ${
+    cmp ${
+      configFile {
+        services.oroshi.settings = {
+          log.level = "warn";
+          storage.max_bytes = 4096;
+        };
+      }
+    } ${
       (pkgs.formats.toml { }).generate "raw-oroshi.toml" {
         server.listen = "127.0.0.1:8081";
         metrics.listen = "127.1.2.3:9000";
-        storage.dir = "/var/lib/oroshi-example";
+        storage = {
+          dir = "/var/lib/oroshi-example";
+          max_bytes = 4096;
+          gc_target_ratio = 0.8;
+        };
+        gc.orphan_grace = 7200;
+        retention.days = 7;
+        tokens.builder = {
+          sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+          scopes = [
+            "nix:write"
+            "nix:pin"
+          ];
+        };
+        nix = {
+          priority = 20;
+          trusted_keys = [ "example.org:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" ];
+          max_nar_bytes = 1024;
+        };
         log = {
           level = "warn";
           access = true;
@@ -155,6 +228,18 @@ in
     cmp ${configFile defaultOptions} ${(pkgs.formats.toml { }).generate "default-oroshi.toml" { }}
     touch "$out"
   '';
+
+  module-config-token-hash = pkgs.testers.testBuildFailure (configFile {
+    services.oroshi.tokens.builder.sha256 = lib.mkForce "malformed";
+  });
+
+  module-config-token-scope = pkgs.testers.testBuildFailure (configFile {
+    services.oroshi.tokens.builder.scopes = lib.mkForce [ "nix:admin" ];
+  });
+
+  module-config-trusted-key = pkgs.testers.testBuildFailure (configFile {
+    services.oroshi.nix.trustedKeys = lib.mkForce [ "example.org:YQ==" ];
+  });
 
   module-config-unknown = pkgs.testers.testBuildFailure (configFile {
     services.oroshi.settings.unexpected = true;
