@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io;
 use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::HttpBody;
@@ -60,7 +60,7 @@ impl Server {
                     priority,
                     trusted_keys,
                     limits,
-                    upload_gate: Arc::default(),
+                    uploads: Default::default(),
                 }),
                 applied,
             ))
@@ -97,18 +97,12 @@ impl Server {
         shutdown: impl Future<Output = ()>,
         notify_socket: Option<OsString>,
     ) -> io::Result<()> {
-        let (stop, mut main_stop) = watch::channel(false);
-        let mut metrics_stop = main_stop.clone();
-        let main = axum::serve(self.main, app).with_graceful_shutdown(async move {
-            let _ = main_stop.changed().await;
-        });
+        let (stop, main_stop) = watch::channel(false);
+        let metrics_stop = main_stop.clone();
+        let main = serve_http(self.main, app, main_stop, Limits::default());
         let metrics = async move {
             if let Some(listener) = self.metrics {
-                axum::serve(listener, metrics_app)
-                    .with_graceful_shutdown(async move {
-                        let _ = metrics_stop.changed().await;
-                    })
-                    .await?;
+                serve_http(listener, metrics_app, metrics_stop, Limits::default()).await?;
             }
             Ok::<_, io::Error>(())
         };
@@ -127,6 +121,62 @@ impl Server {
             }
         }
     }
+}
+
+/// Connection limits that `axum::serve` (0.7) cannot set.
+struct Limits {
+    connections: usize,
+    header_read_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        // Each connection may hold a socket, a blob and a SQLite reader: keep well under LimitNOFILE.
+        Self {
+            connections: 1024,
+            header_read_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Serve HTTP/1 until `stop` changes, then drain in-flight connections.
+async fn serve_http(
+    listener: TcpListener,
+    app: Router,
+    mut stop: watch::Receiver<bool>,
+    limits: Limits,
+) -> io::Result<()> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.connections));
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    loop {
+        let accepted = tokio::select! {
+            accepted = async {
+                let permit = permits.clone().acquire_owned().await;
+                (permit, listener.accept().await)
+            } => accepted,
+            _ = stop.changed() => break,
+        };
+        let (Ok(permit), Ok((stream, _))) = accepted else {
+            // Accept errors such as EMFILE are transient: back off instead of exiting.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let connection = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(limits.header_read_timeout)
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(stream),
+                hyper_util::service::TowerToHyperService::new(app.clone()),
+            );
+        let connection = graceful.watch(connection);
+        tokio::spawn(async move {
+            let _ = connection.await;
+            drop(permit);
+        });
+    }
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
 }
 
 pub(crate) fn lock_state(root: &std::path::Path) -> io::Result<std::fs::File> {
@@ -429,6 +479,30 @@ mod tests {
         for addr in [main, metrics] {
             assert!(tokio::net::TcpStream::connect(addr).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn idle_connections_time_out_and_release_their_connection_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let app = Router::new().route("/healthz", get(|| async { StatusCode::OK }));
+        let limits = Limits {
+            connections: 1,
+            header_read_timeout: Duration::from_millis(300),
+        };
+        let _running = Running(tokio::spawn(serve_http(listener, app, stopped, limits)));
+        let start = Instant::now();
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // The only slot is held by a client that never sends headers until the timeout closes it.
+        let response = request(addr, "GET", "/healthz").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        let mut rest = Vec::new();
+        timeout(Duration::from_secs(5), idle.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .ok();
     }
 
     #[tokio::test]

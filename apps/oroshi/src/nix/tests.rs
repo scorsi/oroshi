@@ -14,7 +14,7 @@ pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Store>, Vec<u8>, NarInfo) {
         blobs: BlobStore::open(root.path()).unwrap(),
         database: Database::open(root.path()).unwrap().0,
         limits: UploadLimits::new(&crate::config::Config::default()),
-        upload_gate: Arc::default(),
+        uploads: Default::default(),
         priority: 17,
         trusted_keys: Vec::new(),
     });
@@ -37,7 +37,16 @@ pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Store>, Vec<u8>, NarInfo) {
             )
             .unwrap();
     }
-    store.database.commit_narinfo(&info, "upload", 0).unwrap();
+    // Raw rows: this payload deliberately differs from the fixture's FileHash.
+    store
+        .database
+        .writer()
+        .unwrap()
+        .execute(
+            "INSERT INTO narinfo VALUES (?1, ?2, ?3, ?4, 'upload', 0)",
+            (&info.store_path, HASH, &info.url, FIXTURE),
+        )
+        .unwrap();
     store
         .database
         .writer()

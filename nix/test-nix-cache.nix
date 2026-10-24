@@ -39,7 +39,7 @@ pkgs.testers.runNixOSTest {
       imports = [ self.nixosModules.default ];
       services.oroshi = {
         enable = true;
-        listen = "0.0.0.0:8080";
+        listen = "127.0.0.1:8081";
         metrics.listen = "127.0.0.1:9000";
         tokens.builder = {
           sha256 = templateHash;
@@ -59,6 +59,12 @@ pkgs.testers.runNixOSTest {
         storage.maxBytes = templateMaxBytes;
       };
       networking.firewall.allowedTCPPorts = [ 8080 ];
+      # Stands in for the deployment's proxy: oroshi accepts loopback peers only.
+      # A byte relay keeps the clients' exact HTTP exchanges (Expect, early refusals).
+      systemd.services.oroshi-relay = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8080,fork,reuseaddr TCP:127.0.0.1:8081";
+      };
       environment.systemPackages = [ pkgs.curl ];
       # Provision the generated public key/hash before starting the service.
       systemd.services.oroshi = {
@@ -171,6 +177,7 @@ pkgs.testers.runNixOSTest {
             cache.succeed("printf %s " + shlex.quote(config) + " > /run/oroshi-test.toml")
             cache.succeed("systemctl restart oroshi.service")
             cache.wait_for_unit("oroshi.service")
+            cache.wait_for_open_port(8081)
             cache.wait_for_open_port(8080)
 
         start_cache()
@@ -179,6 +186,10 @@ pkgs.testers.runNixOSTest {
         host.succeed("cp --remove-destination /run/nix-test.conf /etc/nix/nix.conf")
         host.succeed("systemctl restart nix-daemon.service")
         builder.succeed("systemctl restart nix-daemon.service")
+
+    with subtest("the unit is hardened"):
+        # Exposure is scored 0-100 (shown as 0.0-10.0); 30 leaves margin over the hardened unit.
+        cache.succeed("systemd-analyze security --threshold=30 --no-pager oroshi.service")
 
     def narinfo(path):
         store_hash = path.removeprefix("/nix/store/").split("-", 1)[0]

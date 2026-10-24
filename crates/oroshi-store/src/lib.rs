@@ -2,7 +2,7 @@
 
 mod database;
 
-pub use database::{Database, DatabaseError};
+pub use database::{Database, DatabaseError, Reader};
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -52,7 +52,11 @@ impl BlobStore {
             sync_directory(&directory)?;
         }
         for entry in fs::read_dir(root.join("tmp"))? {
-            fs::remove_file(entry?.path())?;
+            let entry = entry?;
+            // Uploads only create files; a stray directory must not turn startup into a restart loop.
+            if !entry.file_type()?.is_dir() {
+                fs::remove_file(entry.path())?;
+            }
         }
         File::open(root.join("tmp"))?.sync_all()?;
         if initialize {
@@ -107,6 +111,8 @@ impl BlobStore {
         temp.file.sync_all()?;
         let path = self.blob_path(&hash);
         let directory = path.parent().unwrap();
+        // Hashed outside the lock: a blob whose bytes no longer match its name is replaced.
+        let sound = path.try_exists()? && hash_file(&path)? == hash;
         // Serialize the existence check and rename so concurrent uploads never replace a blob.
         let _publish = self
             .publish
@@ -114,7 +120,7 @@ impl BlobStore {
             .map_err(|_| io::Error::other("blob publication lock poisoned"))?;
         fs::create_dir_all(directory)?;
         File::open(directory.parent().unwrap())?.sync_all()?;
-        if !path.try_exists()? {
+        if !sound || !path.try_exists()? {
             fs::rename(&temp.path, &path)?;
         }
         File::open(directory)?.sync_all()?;
@@ -130,6 +136,12 @@ impl BlobStore {
         let name = hex(hash);
         self.root.join("blobs/sha256").join(&name[..2]).join(name)
     }
+}
+
+fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    io::copy(&mut File::open(path)?, &mut digest)?;
+    Ok(digest.finalize().into())
 }
 
 fn hex(bytes: &[u8]) -> String {

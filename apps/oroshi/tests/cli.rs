@@ -269,8 +269,8 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
             .filter(|line| line["event"] == "migration-applied")
             .collect();
         if signal == "-TERM" {
-            assert_eq!(migrations.len(), 1);
-            assert_eq!(migrations[0]["version"], 1);
+            let versions: Vec<_> = migrations.iter().map(|line| &line["version"]).collect();
+            assert_eq!(versions, [1, 2]);
         } else {
             assert!(migrations.is_empty());
         }

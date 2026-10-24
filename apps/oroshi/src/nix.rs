@@ -25,10 +25,39 @@ pub struct Store {
     pub priority: u32,
     pub trusted_keys: Vec<PublicKey>,
     pub limits: UploadLimits,
-    pub upload_gate: Arc<tokio::sync::Mutex<()>>,
+    pub uploads: Uploads,
 }
 
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Concurrent NAR uploads; each holds a blocking-pool thread while streaming.
+pub(crate) const UPLOAD_CONCURRENCY: usize = 32;
+
+/// In-flight NAR uploads: a concurrency limit and the bytes reserved against `max_bytes`.
+pub struct Uploads {
+    pub(crate) permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) reserved: std::sync::Mutex<u64>,
+}
+
+impl Default for Uploads {
+    fn default() -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(UPLOAD_CONCURRENCY)),
+            reserved: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+/// Bytes held against the storage cap until the upload registers or fails.
+struct Reservation<'a>(&'a std::sync::Mutex<u64>, u64);
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        // Registration commits before this runs, so stored + reserved never undercounts.
+        if let Ok(mut reserved) = self.0.lock() {
+            *reserved -= self.1;
+        }
+    }
+}
 
 pub struct UploadLimits {
     pub max_nar_bytes: u64,
@@ -87,7 +116,10 @@ pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>, registry: Arc<Registry>) -
             registry,
             observe_upload,
         ))
-        .layer(axum::middleware::from_fn_with_state(tokens, authorize_put))
+        .layer(axum::middleware::from_fn_with_state(
+            tokens,
+            authorize_writes,
+        ))
         .with_state(store)
 }
 
@@ -171,12 +203,13 @@ async fn observe_upload(
     response
 }
 
-async fn authorize_put(
+// Deny by default: every method except anonymous reads needs the write scope.
+async fn authorize_writes(
     State(tokens): State<Arc<Tokens>>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() != Method::PUT {
+    if matches!(*request.method(), Method::GET | Method::HEAD) {
         return next.run(request).await;
     }
     auth::require_scope(State(tokens), request, next).await
@@ -256,23 +289,15 @@ async fn put_narinfo(
             .strip_prefix("nar/")
             .ok_or_else(|| failure("bad-name"))?;
         file_hash(file).ok_or_else(|| failure("bad-name"))?;
-        let blob = store
-            .database
-            .nar_blob(&info.url)
-            .map_err(internal)?
-            .ok_or_else(|| failure("missing-nar"))?;
-        if info.file_hash != Some(blob.hash) {
-            return Err(failure("hash-mismatch"));
-        }
-        if info.file_size != Some(blob.size) {
-            return Err(failure("file-size-mismatch"));
-        }
         store
             .database
             .commit_narinfo(&info, "upload", now()?)
             .map_err(|error| match error {
                 DatabaseError::NarinfoConflict => UploadError(StatusCode::CONFLICT, "conflict"),
                 DatabaseError::MissingReference => failure("missing-reference"),
+                DatabaseError::MissingNar => failure("missing-nar"),
+                DatabaseError::FileHashMismatch => failure("hash-mismatch"),
+                DatabaseError::FileSizeMismatch => failure("file-size-mismatch"),
                 _ => internal(error),
             })?;
         Ok((
@@ -454,40 +479,45 @@ impl Read for UploadReader {
 async fn put_nar(
     State(store): State<Arc<Store>>,
     Path(file): Path<String>,
+    headers: header::HeaderMap,
     body: Body,
 ) -> Result<Response, UploadError> {
     let hash = file_hash(&file).ok_or(UploadError(StatusCode::FORBIDDEN, "bad-name"))?;
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
     let reader = UploadReader::new(body, &store.limits);
-    // shortcut: serialize capped uploads through registration; reserve bytes if parallel uploads are needed.
-    let gate = if store.limits.max_bytes.is_some() {
-        Some(
-            timeout_at(
-                reader.deadline.min(reader.idle_deadline),
-                store.upload_gate.clone().lock_owned(),
-            )
-            .await
-            .map_err(|_| {
-                UploadError(
-                    StatusCode::REQUEST_TIMEOUT,
-                    if reader.deadline <= reader.idle_deadline {
-                        "deadline"
-                    } else {
-                        "idle"
-                    },
-                )
-            })?,
+    let permit = timeout_at(
+        reader.deadline.min(reader.idle_deadline),
+        store.uploads.permits.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        UploadError(
+            StatusCode::REQUEST_TIMEOUT,
+            if reader.deadline <= reader.idle_deadline {
+                "deadline"
+            } else {
+                "idle"
+            },
         )
-    } else {
-        None
-    };
+    })?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     tokio::task::spawn_blocking(move || {
-        let _gate = gate;
-        let remaining = match store.limits.max_bytes {
+        let _permit = permit;
+        let max_nar_bytes = store.limits.max_nar_bytes;
+        let (remaining, _reservation) = match store.limits.max_bytes {
             Some(cap) => {
+                let mut reserved = store
+                    .uploads
+                    .reserved
+                    .lock()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 let used = store
                     .database
                     .stored_bytes()
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .saturating_add(*reserved);
                 let existing = store
                     .database
                     .blob_size(&hash)
@@ -499,17 +529,37 @@ async fn put_nar(
                     ));
                 }
                 // Re-uploading an immutable hash consumes no additional stored bytes.
-                cap.saturating_sub(used)
-                    .saturating_add(existing.unwrap_or(0))
+                let remaining = cap
+                    .saturating_sub(used)
+                    .saturating_add(existing.unwrap_or(0));
+                if existing.is_none()
+                    && remaining < max_nar_bytes
+                    && length.is_some_and(|length| length > remaining)
+                {
+                    return Err(UploadError(
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        "storage-full",
+                    ));
+                }
+                let amount = if existing.is_some() {
+                    0
+                } else {
+                    remaining.min(max_nar_bytes).min(length.unwrap_or(u64::MAX))
+                };
+                *reserved += amount;
+                (
+                    remaining,
+                    Some(Reservation(&store.uploads.reserved, amount)),
+                )
             }
-            None => u64::MAX,
+            None => (u64::MAX, None),
         };
-        let cap = store.limits.max_nar_bytes.min(remaining);
+        let cap = max_nar_bytes.min(remaining);
         let blob = store
             .blobs
             .write(reader, cap, Some(&hash))
             .map_err(|error| match error.kind() {
-                io::ErrorKind::FileTooLarge if remaining < store.limits.max_nar_bytes => {
+                io::ErrorKind::FileTooLarge if remaining < max_nar_bytes => {
                     UploadError(StatusCode::INSUFFICIENT_STORAGE, "storage-full")
                 }
                 io::ErrorKind::FileTooLarge => {

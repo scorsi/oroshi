@@ -84,6 +84,31 @@ fn identical_upload_preserves_the_existing_file() {
 }
 
 #[test]
+fn corrupted_existing_blob_is_replaced_by_a_verified_upload() {
+    let root = tempfile::tempdir().unwrap();
+    let store = BlobStore::open(root.path()).unwrap();
+    let blob = store.write(&b"abc"[..], 3, None).unwrap();
+    fs::write(store.blob_path(&blob.hash), b"rot").unwrap();
+    assert_eq!(store.write(&b"abc"[..], 3, None).unwrap(), blob);
+    assert_eq!(fs::read(store.blob_path(&blob.hash)).unwrap(), b"abc");
+    assert_empty(&root.path().join("tmp"));
+}
+
+#[test]
+fn startup_skips_directories_in_tmp() {
+    let root = tempfile::tempdir().unwrap();
+    drop(BlobStore::open(root.path()).unwrap());
+    fs::create_dir(root.path().join("tmp/stray")).unwrap();
+    fs::write(root.path().join("tmp/partial"), b"partial").unwrap();
+    BlobStore::open(root.path()).unwrap();
+    let left: Vec<_> = fs::read_dir(root.path().join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["stray"]);
+}
+
+#[test]
 fn startup_removes_leftover_temp_files_but_keeps_blobs() {
     let root = tempfile::tempdir().unwrap();
     let store = BlobStore::open(root.path()).unwrap();

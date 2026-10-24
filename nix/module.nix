@@ -47,6 +47,10 @@ let
   ) cfg.settings;
   stateDir = settings.storage.dir or cfg.stateDir;
   metricsListen = settings.metrics.listen or cfg.metrics.listen;
+  serverListen = settings.server.listen or cfg.listen;
+  isLoopback =
+    address:
+    builtins.match "(127\\.[0-9]+\\.[0-9]+\\.[0-9]+|\\[(0*:)*:?(0*:)*0*1]):[0-9]+" address != null;
   configFile =
     let
       raw = toml.generate "oroshi.toml" settings;
@@ -169,12 +173,13 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion =
-          metricsListen == null
-          ||
-            builtins.match "(127\\.[0-9]+\\.[0-9]+\\.[0-9]+|\\[(0*:)*:?(0*:)*0*1]):[0-9]+" metricsListen
-            != null;
+        assertion = metricsListen == null || isLoopback metricsListen;
         message = "services.oroshi.metrics.listen must be a loopback socket address.";
+      }
+      {
+        # Clients reach oroshi only through the TLS proxy (ADR 0010); the unit also denies non-local peers.
+        assertion = isLoopback serverListen;
+        message = "services.oroshi.listen must be a loopback socket address.";
       }
       {
         assertion = lib.hasPrefix "/" stateDir;
@@ -211,6 +216,38 @@ in
           "AF_INET6"
         ];
         UMask = "0027";
+        ProtectHome = true;
+        PrivateDevices = true;
+        PrivateUsers = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        RemoveIPC = true;
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
+        SystemCallArchitectures = "native";
+        # Only the co-located proxy and the loopback metrics scraper may connect.
+        IPAddressAllow = "localhost";
+        IPAddressDeny = "any";
+        # Above the 1024 connections oroshi accepts, each with a blob and a SQLite reader.
+        LimitNOFILE = 8192;
+        # Tokio's blocking pool tops out at 512 threads.
+        TasksMax = 1024;
+        # A core dump could hold a presented token.
+        LimitCORE = 0;
         LogRateLimitIntervalSec = lib.mkDefault "30s";
         LogRateLimitBurst = lib.mkDefault 30000;
       };

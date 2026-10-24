@@ -216,7 +216,7 @@ async fn commits_count_actual_bytes_and_scrapes_refresh_deduplicated_database_ga
         priority: 30,
         trusted_keys: Vec::new(),
         limits: crate::nix::UploadLimits::new(&Config::default()),
-        upload_gate: Arc::default(),
+        uploads: Default::default(),
     });
     let registry = Arc::new(Registry::new());
     for expected in [payload.len(), 0] {

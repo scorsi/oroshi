@@ -506,6 +506,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "hyper",
+ "hyper-util",
  "oroshi-nix",
  "oroshi-store",
  "serde",

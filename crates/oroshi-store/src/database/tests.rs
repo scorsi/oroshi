@@ -448,11 +448,10 @@ fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
 fn absent_nar_refuses_commit_without_rows() {
     let root = tempfile::tempdir().unwrap();
     let database = Database::open(root.path()).unwrap().0;
-    assert_constraint(
-        database
-            .commit_narinfo(&libiconv(), "upload", 2000)
-            .unwrap_err(),
-    );
+    assert!(matches!(
+        database.commit_narinfo(&libiconv(), "upload", 2000),
+        Err(DatabaseError::MissingNar)
+    ));
     assert!(stored_paths(&database).is_empty());
     assert!(edges(&database).is_empty());
 }
@@ -698,4 +697,81 @@ fn open_reports_only_committed_migration_versions() {
     assert_eq!(applied, (1..=MIGRATIONS.len()).collect::<Vec<_>>());
     drop(database);
     assert!(Database::open(root.path()).unwrap().1.is_empty());
+}
+
+#[test]
+fn nar_file_hash_and_size_are_checked_inside_the_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap().0;
+    let info = libiconv();
+    register_nar(&database, &info);
+    let mut wrong = info.clone();
+    wrong.file_size = Some(info.file_size.unwrap() + 1);
+    assert!(matches!(
+        database.commit_narinfo(&wrong, "upload", 2000),
+        Err(DatabaseError::FileSizeMismatch)
+    ));
+    wrong = info.clone();
+    wrong.file_hash = Some([0; 32]);
+    assert!(matches!(
+        database.commit_narinfo(&wrong, "upload", 2000),
+        Err(DatabaseError::FileHashMismatch)
+    ));
+    assert!(stored_paths(&database).is_empty());
+    database.commit_narinfo(&info, "upload", 2000).unwrap();
+}
+
+#[test]
+fn version_one_databases_gain_the_access_and_reference_indexes() {
+    let root = tempfile::tempdir().unwrap();
+    {
+        let directory = root.path().join("db");
+        fs::create_dir_all(&directory).unwrap();
+        let mut connection = Connection::open(directory.join("oroshi.sqlite")).unwrap();
+        assert_eq!(migrate(&mut connection, &MIGRATIONS[..1]).unwrap(), [1]);
+    }
+    let (database, applied) = Database::open(root.path()).unwrap();
+    assert_eq!(applied, (2..=MIGRATIONS.len()).collect::<Vec<_>>());
+    let plan = |sql: &str| -> String {
+        database
+            .reader()
+            .unwrap()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    };
+    assert!(
+        plan("UPDATE narinfo SET last_accessed_at = 0 WHERE nar_url = 'x'")
+            .contains("narinfo_nar_url")
+    );
+    assert!(plan("SELECT 1 FROM reference WHERE reference = 'x'").contains("reference_reference"));
+}
+
+#[test]
+fn readers_are_pooled_unless_left_in_a_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap().0;
+    let cache_size = |reader: &Connection| -> i64 {
+        reader
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap()
+    };
+    let default = cache_size(&database.reader().unwrap());
+    database
+        .reader()
+        .unwrap()
+        .execute_batch("PRAGMA cache_size = 1234")
+        .unwrap();
+    assert_eq!(cache_size(&database.reader().unwrap()), 1234);
+    let reader = database.reader().unwrap();
+    reader
+        .execute_batch("PRAGMA cache_size = 99; BEGIN")
+        .unwrap();
+    drop(reader);
+    assert_ne!(cache_size(&database.reader().unwrap()), 99);
+    assert_ne!(default, 1234);
 }

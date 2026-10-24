@@ -117,6 +117,12 @@ in
     assert rawState.services.oroshi.persistPaths == [ "/var/lib/oroshi-raw" ];
     assert rawState.systemd.services.oroshi.serviceConfig.ReadWritePaths == [ "/var/lib/oroshi-raw" ];
     assert !(assertionsPass { services.oroshi.settings.storage.dir = "relative"; });
+    assert !(assertionsPass { services.oroshi.listen = lib.mkForce "0.0.0.0:8080"; });
+    assert !(assertionsPass { services.oroshi.settings.server.listen = "192.0.2.1:8080"; });
+    assert assertionsPass { services.oroshi.listen = lib.mkForce "[::1]:8080"; };
+    assert
+      unit.serviceConfig.IPAddressAllow == "localhost" && unit.serviceConfig.IPAddressDeny == "any";
+    assert unit.serviceConfig.LimitCORE == 0 && unit.serviceConfig.LimitNOFILE == 8192;
     assert
       (evaluate false {
         systemd.services.oroshi.serviceConfig = {

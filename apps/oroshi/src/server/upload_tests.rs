@@ -21,7 +21,7 @@ fn fixture_with_limits(
         blobs: oroshi_store::BlobStore::open(root.path()).unwrap(),
         database: oroshi_store::Database::open(root.path()).unwrap().0,
         limits,
-        upload_gate: Arc::default(),
+        uploads: Default::default(),
         priority: 30,
         trusted_keys: vec![
             include_str!(
@@ -48,7 +48,7 @@ fn path(bytes: &[u8], suffix: &str) -> String {
 }
 
 pub(super) async fn request(
-    mut app: impl axum::ServiceExt<Request, Response = Response, Error = Infallible>,
+    app: impl axum::ServiceExt<Request, Response = Response, Error = Infallible>,
     method: &str,
     path: &str,
     credential: Option<&str>,
@@ -58,7 +58,14 @@ pub(super) async fn request(
     if let Some(credential) = credential {
         request = request.header(header::AUTHORIZATION, credential);
     }
-    app.call(request.body(body).unwrap()).await.unwrap()
+    send(app, request.body(body).unwrap()).await
+}
+
+async fn send(
+    mut app: impl axum::ServiceExt<Request, Response = Response, Error = Infallible>,
+    request: Request,
+) -> Response {
+    app.call(request).await.unwrap()
 }
 
 pub(super) fn row_count(store: &crate::nix::Store, table: &str) -> i64 {
@@ -690,4 +697,83 @@ async fn nar_refusal_reasons_are_plain_text_and_logged_verbatim() {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["reason"], expected);
     }
+}
+
+#[tokio::test]
+async fn non_read_methods_require_a_token_on_every_nix_route() {
+    let (_root, _store, app) = fixture();
+    let nar = path(b"data", ".nar");
+    for method in ["POST", "DELETE", "PATCH"] {
+        for target in ["/nix/nix-cache-info", "/nix/_oroshi/pin", nar.as_str()] {
+            let response = request(app.clone(), method, target, None, Body::empty()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {target}"
+            );
+        }
+    }
+    let authorized = request(
+        app.clone(),
+        "POST",
+        "/nix/nix-cache-info",
+        Some("secret"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(authorized.status(), StatusCode::METHOD_NOT_ALLOWED);
+    for method in ["GET", "HEAD"] {
+        let response = request(
+            app.clone(),
+            method,
+            "/nix/nix-cache-info",
+            None,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn capped_uploads_reserve_declared_bytes_and_run_in_parallel() {
+    let (_root, store, app) = fixture_with_limits(limits("[storage]\nmax_bytes = 8"));
+    let put = |target: String, body: Body| {
+        send(
+            app.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri(target)
+                .header(header::AUTHORIZATION, "secret")
+                .header(header::CONTENT_LENGTH, 4)
+                .body(body)
+                .unwrap(),
+        )
+    };
+    let reserved = || *store.uploads.reserved.lock().unwrap();
+    let permits = || store.uploads.permits.available_permits();
+    // A stalled upload holds one permit and its 4 declared bytes, not the whole store.
+    let (reader, writer) = tokio::io::duplex(1);
+    let stalled = tokio::spawn(put(
+        path(b"xxxx", ".nar"),
+        Body::from_stream(ReaderStream::new(reader)),
+    ));
+    for _ in 0..500 {
+        if reserved() == 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(reserved(), 4);
+    assert_eq!(permits(), crate::nix::UPLOAD_CONCURRENCY - 1);
+    let parallel = put(path(b"data", ".nar"), Body::from("data")).await;
+    assert_eq!(parallel.status(), StatusCode::NO_CONTENT);
+    let over = put(path(b"more", ".nar"), Body::from("more")).await;
+    assert_eq!(over.status(), StatusCode::INSUFFICIENT_STORAGE);
+    drop(writer);
+    assert_eq!(stalled.await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!((reserved(), permits()), (0, crate::nix::UPLOAD_CONCURRENCY));
+    let released = put(path(b"more", ".nar"), Body::from("more")).await;
+    assert_eq!(released.status(), StatusCode::NO_CONTENT);
+    assert_eq!(store.database.stored_bytes().unwrap(), 8);
 }

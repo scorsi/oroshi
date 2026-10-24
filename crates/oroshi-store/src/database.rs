@@ -10,7 +10,14 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::Blob;
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    // Anonymous NAR reads update by nar_url under the writer lock; GC deletes check references.
+    "CREATE INDEX narinfo_nar_url ON narinfo (nar_url);
+     CREATE INDEX reference_reference ON reference (reference);",
+];
+/// Idle read-only connections kept for reuse; extra concurrent readers are closed after use.
+const POOLED_READERS: usize = 16;
 
 #[derive(Debug)]
 pub enum DatabaseError {
@@ -21,6 +28,9 @@ pub enum DatabaseError {
     WriterPoisoned,
     NarinfoConflict,
     MissingReference,
+    MissingNar,
+    FileHashMismatch,
+    FileSizeMismatch,
     InvalidNarinfo(ParseError),
 }
 
@@ -36,6 +46,13 @@ impl fmt::Display for DatabaseError {
             ),
             Self::NarinfoConflict => f.write_str("conflicting narinfo metadata"),
             Self::MissingReference => f.write_str("missing narinfo reference"),
+            Self::MissingNar => f.write_str("narinfo URL names no registered NAR"),
+            Self::FileHashMismatch => {
+                f.write_str("narinfo FileHash differs from the registered NAR")
+            }
+            Self::FileSizeMismatch => {
+                f.write_str("narinfo FileSize differs from the registered NAR")
+            }
             Self::InvalidNarinfo(error) => write!(f, "invalid stored narinfo: {error}"),
             Self::WriterPoisoned => f.write_str("database writer lock poisoned"),
         }
@@ -70,6 +87,40 @@ impl From<rusqlite::Error> for DatabaseError {
 pub struct Database {
     path: PathBuf,
     writer: Mutex<Connection>,
+    readers: Mutex<Vec<Connection>>,
+}
+
+/// A pooled read-only connection, returned to the pool on drop.
+pub struct Reader<'a> {
+    pool: &'a Mutex<Vec<Connection>>,
+    connection: Option<Connection>,
+}
+
+impl std::ops::Deref for Reader<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.connection.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for Reader<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.connection.as_mut().unwrap()
+    }
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        let connection = self.connection.take().unwrap();
+        // A connection left inside a transaction would pin an old snapshot for its next user.
+        if connection.is_autocommit()
+            && let Ok(mut pool) = self.pool.lock()
+            && pool.len() < POOLED_READERS
+        {
+            pool.push(connection);
+        }
+    }
 }
 
 impl Database {
@@ -91,6 +142,7 @@ impl Database {
             Self {
                 path,
                 writer: Mutex::new(writer),
+                readers: Mutex::default(),
             },
             applied,
         ))
@@ -142,7 +194,8 @@ impl Database {
     }
 
     /// Commit a parsed narinfo, its existing NAR link and all reference edges atomically.
-    /// The NAR must already be registered by its upload. Foreign keys refuse absent
+    /// The NAR must already be registered by its upload, with the narinfo's FileHash and
+    /// FileSize; both are checked inside the transaction. Foreign keys refuse absent
     /// dependencies; inserting the narinfo first permits its self-edge (ADR 0005).
     /// Existing paths merge signatures only; all other metadata is immutable.
     /// `accessed_at` is Unix time in seconds.
@@ -155,6 +208,21 @@ impl Database {
         let path = parse_store_path(&info.store_path).map_err(DatabaseError::InvalidStorePath)?;
         let mut writer = self.writer()?;
         let transaction = writer.transaction()?;
+        let blob: Option<(Vec<u8>, u64)> = transaction
+            .query_row(
+                "SELECT blob.sha256, blob.size FROM nar JOIN blob ON nar.blob_sha256 = blob.sha256
+                 WHERE nar.url = ?1",
+                [&info.url],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (hash, size) = blob.ok_or(DatabaseError::MissingNar)?;
+        if info.file_hash.as_ref().map(|hash| hash.as_slice()) != Some(hash.as_slice()) {
+            return Err(DatabaseError::FileHashMismatch);
+        }
+        if info.file_size != Some(size) {
+            return Err(DatabaseError::FileSizeMismatch);
+        }
         let existing: Option<String> = transaction
             .query_row(
                 "SELECT content FROM narinfo WHERE store_hash = ?1",
@@ -262,11 +330,27 @@ impl Database {
             .map_err(|_| DatabaseError::WriterPoisoned)
     }
 
-    /// Each reader has an independent, read-only connection and snapshot.
-    pub fn reader(&self) -> Result<Connection, DatabaseError> {
-        let reader = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        reader.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(reader)
+    /// Each reader has an independent, read-only connection and snapshot,
+    /// reused from a small pool to avoid an open and schema parse per request.
+    pub fn reader(&self) -> Result<Reader<'_>, DatabaseError> {
+        let pooled = self
+            .readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        let connection = match pooled {
+            Some(connection) => connection,
+            None => {
+                let reader =
+                    Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                reader.execute_batch("PRAGMA foreign_keys = ON;")?;
+                reader
+            }
+        };
+        Ok(Reader {
+            pool: &self.readers,
+            connection: Some(connection),
+        })
     }
 }
 
