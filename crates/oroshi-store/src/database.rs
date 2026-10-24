@@ -19,6 +19,9 @@ pub enum DatabaseError {
     InvalidStorePath(ParseError),
     UnsupportedSchema { found: i64, supported: usize },
     WriterPoisoned,
+    NarinfoConflict,
+    MissingReference,
+    InvalidNarinfo(ParseError),
 }
 
 impl fmt::Display for DatabaseError {
@@ -31,6 +34,9 @@ impl fmt::Display for DatabaseError {
                 f,
                 "unsupported database schema version {found}; binary supports versions 0..={supported}"
             ),
+            Self::NarinfoConflict => f.write_str("conflicting narinfo metadata"),
+            Self::MissingReference => f.write_str("missing narinfo reference"),
+            Self::InvalidNarinfo(error) => write!(f, "invalid stored narinfo: {error}"),
             Self::WriterPoisoned => f.write_str("database writer lock poisoned"),
         }
     }
@@ -41,7 +47,7 @@ impl std::error::Error for DatabaseError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
-            Self::InvalidStorePath(error) => Some(error),
+            Self::InvalidStorePath(error) | Self::InvalidNarinfo(error) => Some(error),
             _ => None,
         }
     }
@@ -113,7 +119,7 @@ impl Database {
     /// Commit a parsed narinfo, its existing NAR link and all reference edges atomically.
     /// The NAR must already be registered by its upload. Foreign keys refuse absent
     /// dependencies; inserting the narinfo first permits its self-edge (ADR 0005).
-    /// Existing paths are refused; validation and signature merge belong to O1 task 11.
+    /// Existing paths merge signatures only; all other metadata is immutable.
     /// `accessed_at` is Unix time in seconds.
     pub fn commit_narinfo(
         &self,
@@ -124,6 +130,25 @@ impl Database {
         let path = parse_store_path(&info.store_path).map_err(DatabaseError::InvalidStorePath)?;
         let mut writer = self.writer()?;
         let transaction = writer.transaction()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT content FROM narinfo WHERE store_hash = ?1",
+                [path.hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(content) = existing {
+            let mut stored: NarInfo = content.parse().map_err(DatabaseError::InvalidNarinfo)?;
+            stored
+                .merge_signatures(info)
+                .map_err(|_| DatabaseError::NarinfoConflict)?;
+            transaction.execute(
+                "UPDATE narinfo SET content = ?2 WHERE store_hash = ?1",
+                rusqlite::params![path.hash, stored.to_string()],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute(
             "INSERT INTO narinfo (store_path, store_hash, nar_url, content, source, last_accessed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -132,10 +157,19 @@ impl Database {
             ],
         )?;
         for reference in &info.references {
-            transaction.execute(
-                "INSERT INTO reference (referrer, reference) VALUES (?1, ?2)",
-                rusqlite::params![info.store_path, reference],
-            )?;
+            transaction
+                .execute(
+                    "INSERT INTO reference (referrer, reference) VALUES (?1, ?2)",
+                    rusqlite::params![info.store_path, reference],
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::SqliteFailure(ref failure, _)
+                        if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+                    {
+                        DatabaseError::MissingReference
+                    }
+                    _ => DatabaseError::Sqlite(error),
+                })?;
         }
         transaction.commit()?;
         Ok(())

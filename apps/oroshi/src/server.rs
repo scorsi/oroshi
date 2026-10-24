@@ -41,11 +41,19 @@ impl Server {
     pub async fn run(self, config: &Config) -> io::Result<()> {
         let root = config.storage.dir.clone();
         let priority = config.nix.priority;
+        let trusted_keys = config
+            .nix
+            .trusted_keys
+            .iter()
+            .map(|key| key.parse())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
         let store = tokio::task::spawn_blocking(move || {
             Ok::<_, io::Error>(Arc::new(crate::nix::Store {
                 blobs: oroshi_store::BlobStore::open(&root)?,
                 database: oroshi_store::Database::open(&root).map_err(io::Error::other)?,
                 priority,
+                trusted_keys,
             }))
         })
         .await
@@ -129,7 +137,7 @@ fn app(store: Arc<crate::nix::Store>, registry: Arc<Registry>, config: &Config) 
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .nest(
-            "/nix",
+            "/nix/",
             crate::nix::routes(
                 store,
                 Arc::new(crate::auth::Tokens::new(config, "nix:write")),
@@ -432,3 +440,6 @@ mod read_tests;
 
 #[cfg(test)]
 mod upload_tests;
+
+#[cfg(test)]
+mod narinfo_tests;

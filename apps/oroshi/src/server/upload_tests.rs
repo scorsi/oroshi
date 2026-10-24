@@ -9,12 +9,20 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
-fn fixture() -> (tempfile::TempDir, Arc<crate::nix::Store>, Router) {
+pub(super) fn fixture() -> (tempfile::TempDir, Arc<crate::nix::Store>, Router) {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::nix::Store {
         blobs: oroshi_store::BlobStore::open(root.path()).unwrap(),
         database: oroshi_store::Database::open(root.path()).unwrap(),
         priority: 30,
+        trusted_keys: vec![
+            include_str!(
+                "../../../../crates/oroshi-nix/tests/fixtures/narinfo/test.example.org-1.pub"
+            )
+            .trim()
+            .parse()
+            .unwrap(),
+        ],
     });
     let config = Config::parse(&format!(
         "[tokens.writer]\nsha256 = {:?}\nscopes = ['nix:write']\n\
@@ -31,7 +39,7 @@ fn path(bytes: &[u8], suffix: &str) -> String {
     format!("/nix/nar/{}{suffix}", encode_base32(&Sha256::digest(bytes)))
 }
 
-async fn request(
+pub(super) async fn request(
     mut app: impl axum::ServiceExt<Request, Response = Response, Error = Infallible>,
     method: &str,
     path: &str,
@@ -45,7 +53,7 @@ async fn request(
     app.call(request.body(body).unwrap()).await.unwrap()
 }
 
-fn row_count(store: &crate::nix::Store, table: &str) -> i64 {
+pub(super) fn row_count(store: &crate::nix::Store, table: &str) -> i64 {
     store
         .database
         .reader()

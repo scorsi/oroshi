@@ -14,6 +14,7 @@ pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Store>, Vec<u8>, NarInfo) {
         blobs: BlobStore::open(root.path()).unwrap(),
         database: Database::open(root.path()).unwrap(),
         priority: 17,
+        trusted_keys: Vec::new(),
     });
     // Payload identity is tested here; ingest hash/signature validation belongs to task 11.
     let bytes: Vec<u8> = (0..200_000).map(|n| (n % 251) as u8).collect();

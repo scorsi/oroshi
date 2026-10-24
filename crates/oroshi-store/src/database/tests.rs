@@ -327,7 +327,10 @@ fn absent_reference_refuses_commit_without_leaving_a_narinfo_or_edges() {
     let database = Database::open(root.path()).unwrap();
     let info = hello();
     register_nar(&database, &info);
-    assert_constraint(database.commit_narinfo(&info, "upload", 2000).unwrap_err());
+    assert!(matches!(
+        database.commit_narinfo(&info, "upload", 2000),
+        Err(DatabaseError::MissingReference)
+    ));
     assert!(stored_paths(&database).is_empty());
     assert!(edges(&database).is_empty());
     assert!(database.writer().unwrap().is_autocommit());
@@ -469,11 +472,10 @@ fn duplicate_path_never_overwrites_existing_metadata() {
     database.commit_narinfo(&info, "upload", 2000).unwrap();
     let mut changed = info.clone();
     changed.nar_size += 1;
-    assert_constraint(
-        database
-            .commit_narinfo(&changed, "other", 3000)
-            .unwrap_err(),
-    );
+    assert!(matches!(
+        database.commit_narinfo(&changed, "other", 3000),
+        Err(DatabaseError::NarinfoConflict)
+    ));
     let content: String = database
         .reader()
         .unwrap()
@@ -650,4 +652,47 @@ fn read_lookups_resolve_registered_content_and_blob_and_return_none_on_miss() {
         None
     );
     assert_eq!(database.nar_blob("nar/missing.nar").unwrap(), None);
+}
+
+#[test]
+fn concurrent_signature_merges_preserve_both_signatures_and_original_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let info = libiconv();
+    register_nar(&database, &info);
+    let mut initial = info.clone();
+    initial.signatures.clear();
+    database.commit_narinfo(&initial, "upload", 2000).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for signature in &info.signatures {
+            let mut update = initial.clone();
+            update.signatures.push(signature.clone());
+            let database = &database;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                database.commit_narinfo(&update, "other", 3000).unwrap();
+            });
+        }
+    });
+    let reader = database.reader().unwrap();
+    let (content, source, accessed): (String, String, i64) = reader
+        .query_row(
+            "SELECT content, source, last_accessed_at FROM narinfo",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let mut stored: NarInfo = content.parse().unwrap();
+    stored.signatures.sort();
+    let mut expected = info;
+    expected.signatures.sort();
+    assert_eq!(stored, expected);
+    assert_eq!(source, "upload");
+    assert_eq!(accessed, 2000);
+    assert_eq!(
+        edges(&database),
+        [(initial.store_path.clone(), initial.store_path)]
+    );
 }
