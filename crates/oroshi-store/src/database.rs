@@ -92,6 +92,27 @@ impl Database {
         })
     }
 
+    /// Total bytes of registered blobs, counting each content hash once.
+    pub fn stored_bytes(&self) -> Result<u64, DatabaseError> {
+        Ok(self
+            .reader()?
+            .query_row("SELECT coalesce(sum(size), 0) FROM blob", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Size of a registered content hash, independent of its protocol URL.
+    pub fn blob_size(&self, hash: &[u8; 32]) -> Result<Option<u64>, DatabaseError> {
+        Ok(self
+            .reader()?
+            .query_row(
+                "SELECT size FROM blob WHERE sha256 = ?1",
+                [hash.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Register a published blob and its NAR URL atomically; duplicates are no-ops.
     /// Call only after the blob's hash has been verified against its URL.
     pub fn register_nar(

@@ -10,10 +10,18 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 pub(super) fn fixture() -> (tempfile::TempDir, Arc<crate::nix::Store>, Router) {
+    fixture_with_limits(crate::nix::UploadLimits::new(&Config::default()))
+}
+
+fn fixture_with_limits(
+    limits: crate::nix::UploadLimits,
+) -> (tempfile::TempDir, Arc<crate::nix::Store>, Router) {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::nix::Store {
         blobs: oroshi_store::BlobStore::open(root.path()).unwrap(),
         database: oroshi_store::Database::open(root.path()).unwrap(),
+        limits,
+        upload_gate: Arc::default(),
         priority: 30,
         trusted_keys: vec![
             include_str!(
@@ -330,4 +338,302 @@ async fn metadata_failure_rolls_back_rows_and_leaves_a_published_orphan() {
             .open_blob(&Sha256::digest(b"data").into())
             .is_ok()
     );
+}
+
+fn limits(config: &str) -> crate::nix::UploadLimits {
+    crate::nix::UploadLimits::new(&Config::parse(config).unwrap())
+}
+
+#[tokio::test]
+async fn nar_size_cap_refuses_during_stream_and_cleans_partial_file() {
+    let (root, store, app) = fixture_with_limits(limits("[nix]\nmax_nar_bytes = 4096"));
+    let bytes = vec![42; 16384];
+    let body = Body::from_stream(ReaderStream::new(StreamingBody {
+        root: root.path().to_owned(),
+        written: 0,
+        size: bytes.len(),
+        fail: false,
+    }));
+    let response = request(app, "PUT", &path(&bytes, ".nar"), Some("secret"), body).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_empty(root.path(), &store, &bytes);
+}
+
+#[tokio::test]
+async fn storage_cap_uses_stored_bytes_and_refuses_before_polling_when_full() {
+    let (root, store, app) = fixture_with_limits(limits("[storage]\nmax_bytes = 4"));
+    assert_eq!(store.database.stored_bytes().unwrap(), 0);
+    let response = request(
+        app.clone(),
+        "PUT",
+        &path(b"data", ".nar"),
+        Some("secret"),
+        Body::from("data"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(store.database.stored_bytes().unwrap(), 4);
+    // A pending body must be refused immediately without waiting for EOF or idle timeout.
+    let (reader, _writer) = tokio::io::duplex(1);
+    let body = Body::from_stream(ReaderStream::new(reader));
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        request(app, "PUT", &path(b"new", ".nar"), Some("secret"), body),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(store.database.stored_bytes().unwrap(), 4);
+    assert_eq!(row_count(&store, "nar"), 1);
+    assert_eq!(
+        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn storage_cap_refuses_during_stream_and_cleans_partial_file() {
+    let (root, store, app) = fixture_with_limits(limits("[storage]\nmax_bytes = 4096"));
+    let bytes = vec![42; 16384];
+    let body = Body::from_stream(ReaderStream::new(StreamingBody {
+        root: root.path().to_owned(),
+        written: 0,
+        size: bytes.len(),
+        fail: false,
+    }));
+    let response = request(app, "PUT", &path(&bytes, ".nar"), Some("secret"), body).await;
+    assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_empty(root.path(), &store, &bytes);
+}
+
+struct PacedBody {
+    delay: Pin<Box<tokio::time::Sleep>>,
+    interval: std::time::Duration,
+    remaining: usize,
+}
+
+impl AsyncRead for PacedBody {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.delay.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if self.remaining > 0 {
+            buffer.put_slice(b"x");
+            self.remaining -= 1;
+            let next = tokio::time::Instant::now() + self.interval;
+            self.delay.as_mut().reset(next);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn paced_body(interval: std::time::Duration, size: usize) -> Body {
+    Body::from_stream(ReaderStream::new(PacedBody {
+        delay: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
+        interval,
+        remaining: size,
+    }))
+}
+
+#[tokio::test]
+async fn continuous_upload_hits_total_deadline_and_cleans_partial_file() {
+    let mut limits = limits("[gc]\norphan_grace = 1");
+    assert!(limits.deadline < std::time::Duration::from_millis(500));
+    limits.idle_timeout = std::time::Duration::from_secs(1);
+    let (root, store, app) = fixture_with_limits(limits);
+    let bytes = vec![b'x'; 100];
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        request(
+            app,
+            "PUT",
+            &path(&bytes, ".nar"),
+            Some("secret"),
+            paced_body(std::time::Duration::from_millis(10), bytes.len()),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_empty(root.path(), &store, &bytes);
+}
+
+#[tokio::test]
+async fn idle_upload_times_out_and_cleans_partial_file() {
+    let mut limits = limits("");
+    assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(60));
+    limits.deadline = std::time::Duration::from_secs(1);
+    limits.idle_timeout = std::time::Duration::from_millis(50);
+    let (root, store, app) = fixture_with_limits(limits);
+    let start = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        request(
+            app,
+            "PUT",
+            &path(b"xx", ".nar"),
+            Some("secret"),
+            paced_body(std::time::Duration::from_secs(1), 2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    assert_empty(root.path(), &store, b"xx");
+}
+
+#[tokio::test]
+async fn continuous_upload_within_all_limits_succeeds_at_size_boundary() {
+    let mut limits = limits("[nix]\nmax_nar_bytes = 4\n[storage]\nmax_bytes = 4");
+    limits.idle_timeout = std::time::Duration::from_millis(200);
+    let (root, store, app) = fixture_with_limits(limits);
+    let response = request(
+        app,
+        "PUT",
+        &path(b"xxxx", ".nar"),
+        Some("secret"),
+        paced_body(std::time::Duration::from_millis(60), 4),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(store.database.stored_bytes().unwrap(), 4);
+    assert_eq!(row_count(&store, "nar"), 1);
+    assert_eq!(
+        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn concurrent_uploads_cannot_spend_the_same_remaining_capacity() {
+    let (root, store, app) = fixture_with_limits(limits("[storage]\nmax_bytes = 6"));
+    let first_path = path(b"xxxx", ".nar");
+    let second_path = path(b"data", ".nar");
+    let (first, second) = tokio::join!(
+        request(
+            app.clone(),
+            "PUT",
+            &first_path,
+            Some("secret"),
+            paced_body(std::time::Duration::from_millis(10), 4)
+        ),
+        request(app, "PUT", &second_path, Some("secret"), Body::from("data")),
+    );
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::NO_CONTENT, StatusCode::INSUFFICIENT_STORAGE]
+    );
+    assert_eq!(store.database.stored_bytes().unwrap(), 4);
+    assert_eq!(row_count(&store, "nar"), 1);
+    assert_eq!(
+        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn duplicate_hash_with_another_suffix_does_not_consume_capacity() {
+    let (_root, store, app) = fixture_with_limits(limits("[storage]\nmax_bytes = 4"));
+    for suffix in [".nar", ".nar.xz"] {
+        let response = request(
+            app.clone(),
+            "PUT",
+            &path(b"data", suffix),
+            Some("secret"),
+            Body::from("data"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(store.database.stored_bytes().unwrap(), 4);
+    assert_eq!(row_count(&store, "nar"), 2);
+    assert_eq!(row_count(&store, "blob"), 1);
+}
+
+#[tokio::test]
+async fn narinfo_uploads_also_enforce_idle_timeout() {
+    let mut limits = limits("");
+    limits.deadline = std::time::Duration::from_secs(1);
+    limits.idle_timeout = std::time::Duration::from_millis(50);
+    let (root, store, app) = fixture_with_limits(limits);
+    let start = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        request(
+            app,
+            "PUT",
+            &format!("/nix/{}.narinfo", crate::nix::tests::HASH),
+            Some("secret"),
+            paced_body(std::time::Duration::from_secs(1), 2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    assert_empty(root.path(), &store, b"xx");
+}
+
+#[tokio::test]
+async fn storage_total_counts_all_distinct_blobs_without_narinfo() {
+    let (root, store, app) = fixture_with_limits(limits("[storage]\nmax_bytes = 6"));
+    for bytes in ["abc", "def"] {
+        let response = request(
+            app.clone(),
+            "PUT",
+            &path(bytes.as_bytes(), ".nar"),
+            Some("secret"),
+            Body::from(bytes),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(store.database.stored_bytes().unwrap(), 6);
+    assert_eq!(row_count(&store, "narinfo"), 0);
+    let response = request(
+        app,
+        "PUT",
+        &path(b"g", ".nar"),
+        Some("secret"),
+        Body::from("g"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(store.database.stored_bytes().unwrap(), 6);
+    assert_eq!(
+        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn upload_without_any_received_bytes_hits_idle_timeout() {
+    let mut limits = limits("");
+    limits.deadline = std::time::Duration::from_secs(1);
+    limits.idle_timeout = std::time::Duration::from_millis(50);
+    let (root, store, app) = fixture_with_limits(limits);
+    let (reader, _writer) = tokio::io::duplex(1);
+    let start = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        request(
+            app,
+            "PUT",
+            &path(b"data", ".nar"),
+            Some("secret"),
+            Body::from_stream(ReaderStream::new(reader)),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    assert_empty(root.path(), &store, b"data");
 }

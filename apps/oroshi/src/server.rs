@@ -48,12 +48,15 @@ impl Server {
             .map(|key| key.parse())
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?;
+        let limits = crate::nix::UploadLimits::new(config);
         let store = tokio::task::spawn_blocking(move || {
             Ok::<_, io::Error>(Arc::new(crate::nix::Store {
                 blobs: oroshi_store::BlobStore::open(&root)?,
                 database: oroshi_store::Database::open(&root).map_err(io::Error::other)?,
                 priority,
                 trusted_keys,
+                limits,
+                upload_gate: Arc::default(),
             }))
         })
         .await

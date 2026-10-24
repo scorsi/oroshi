@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use oroshi_nix::{NarInfo, PublicKey, decode_base32, parse_sha256, parse_store_path};
 use oroshi_store::{BlobStore, Database, DatabaseError};
+use tokio::time::{Duration, Instant, timeout_at};
 use tokio_util::io::ReaderStream;
 
 use crate::auth::{self, Tokens};
@@ -22,6 +23,43 @@ pub struct Store {
     pub database: Database,
     pub priority: u32,
     pub trusted_keys: Vec<PublicKey>,
+    pub limits: UploadLimits,
+    pub upload_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub struct UploadLimits {
+    pub max_nar_bytes: u64,
+    pub max_bytes: Option<u64>,
+    pub deadline: Duration,
+    #[cfg(test)]
+    pub idle_timeout: Duration,
+}
+
+impl UploadLimits {
+    pub fn new(config: &crate::config::Config) -> Self {
+        Self {
+            max_nar_bytes: config.nix.max_nar_bytes,
+            max_bytes: config.storage.max_bytes,
+            // Stay strictly below half the grace, including odd seconds.
+            deadline: (Duration::from_secs(config.gc.orphan_grace) / 2)
+                .saturating_sub(Duration::from_nanos(1)),
+            #[cfg(test)]
+            idle_timeout: UPLOAD_IDLE_TIMEOUT,
+        }
+    }
+
+    fn idle_timeout(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.idle_timeout
+        }
+        #[cfg(not(test))]
+        {
+            UPLOAD_IDLE_TIMEOUT
+        }
+    }
 }
 
 pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>) -> Router {
@@ -80,12 +118,28 @@ async fn put_narinfo(
     let hash = name
         .strip_suffix(".narinfo")
         .ok_or((StatusCode::FORBIDDEN, "unsupported PUT path".into()))?;
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
+    let mut reader = UploadReader::new(body, &store.limits);
+    let bytes = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).map_err(|error| {
+            (
+                if error.kind() == io::ErrorKind::TimedOut {
+                    StatusCode::REQUEST_TIMEOUT
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "failed to read narinfo body".to_owned(),
+            )
+        })?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| {
         (
-            StatusCode::BAD_REQUEST,
-            "failed to read narinfo body".into(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload worker failed".into(),
         )
-    })?;
+    })??;
     let body = std::str::from_utf8(&bytes)
         .map_err(|_| (StatusCode::BAD_REQUEST, "narinfo is not UTF-8".into()))?;
     let info: NarInfo = body
@@ -253,6 +307,23 @@ struct UploadReader {
     body: Body,
     chunk: Bytes,
     runtime: tokio::runtime::Handle,
+    deadline: Instant,
+    idle_deadline: Instant,
+    idle_timeout: Duration,
+}
+
+impl UploadReader {
+    fn new(body: Body, limits: &UploadLimits) -> Self {
+        let start = Instant::now();
+        Self {
+            body,
+            chunk: Bytes::new(),
+            runtime: tokio::runtime::Handle::current(),
+            deadline: start + limits.deadline,
+            idle_deadline: start + limits.idle_timeout(),
+            idle_timeout: limits.idle_timeout(),
+        }
+    }
 }
 
 impl Read for UploadReader {
@@ -260,14 +331,27 @@ impl Read for UploadReader {
         if buffer.is_empty() {
             return Ok(0);
         }
+        if Instant::now() >= self.deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
         while self.chunk.is_empty() {
-            let frame = self.runtime.block_on(std::future::poll_fn(|cx| {
-                Pin::new(&mut self.body).poll_frame(cx)
-            }));
+            if Instant::now() >= self.deadline.min(self.idle_deadline) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let frame = self
+                .runtime
+                .block_on(timeout_at(
+                    self.deadline.min(self.idle_deadline),
+                    std::future::poll_fn(|cx| Pin::new(&mut self.body).poll_frame(cx)),
+                ))
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
             let Some(frame) = frame else { return Ok(0) };
             let frame =
                 frame.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             if let Ok(data) = frame.into_data() {
+                if !data.is_empty() {
+                    self.idle_deadline = Instant::now() + self.idle_timeout;
+                }
                 self.chunk = data;
             }
         }
@@ -283,16 +367,51 @@ async fn put_nar(
     body: Body,
 ) -> Result<StatusCode, StatusCode> {
     let hash = file_hash(&file).ok_or(StatusCode::FORBIDDEN)?;
-    let reader = UploadReader {
-        body,
-        chunk: Bytes::new(),
-        runtime: tokio::runtime::Handle::current(),
+    let reader = UploadReader::new(body, &store.limits);
+    // shortcut: serialize capped uploads through registration; reserve bytes if parallel uploads are needed.
+    let gate = if store.limits.max_bytes.is_some() {
+        Some(
+            timeout_at(
+                reader.deadline.min(reader.idle_deadline),
+                store.upload_gate.clone().lock_owned(),
+            )
+            .await
+            .map_err(|_| StatusCode::REQUEST_TIMEOUT)?,
+        )
+    } else {
+        None
     };
     tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        let remaining = match store.limits.max_bytes {
+            Some(cap) => {
+                let used = store
+                    .database
+                    .stored_bytes()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let existing = store
+                    .database
+                    .blob_size(&hash)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if used >= cap && existing.is_none() {
+                    return Err(StatusCode::INSUFFICIENT_STORAGE);
+                }
+                // Re-uploading an immutable hash consumes no additional stored bytes.
+                cap.saturating_sub(used)
+                    .saturating_add(existing.unwrap_or(0))
+            }
+            None => u64::MAX,
+        };
+        let cap = store.limits.max_nar_bytes.min(remaining);
         let blob = store
             .blobs
-            .write(reader, u64::MAX, Some(&hash))
+            .write(reader, cap, Some(&hash))
             .map_err(|error| match error.kind() {
+                io::ErrorKind::FileTooLarge if remaining < store.limits.max_nar_bytes => {
+                    StatusCode::INSUFFICIENT_STORAGE
+                }
+                io::ErrorKind::FileTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                io::ErrorKind::TimedOut => StatusCode::REQUEST_TIMEOUT,
                 io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             })?;
