@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/oroshi-store", "crates/oroshi-nix", "apps/oroshi"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
