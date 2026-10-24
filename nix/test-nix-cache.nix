@@ -334,11 +334,14 @@ pkgs.testers.runNixOSTest {
             base = [line for line in info.splitlines() if not line.startswith("Sig: ")]
             sig = {line.split(":")[1].strip(): line for line in signatures(info)}
             nar = next(line.removeprefix("URL: ") for line in base if line.startswith("URL: "))
+            # Nix and oroshi serialize Sig before CA; keep that order so served text is comparable.
+            ca = [line for line in base if line.startswith("CA: ")]
+            head = [line for line in base if not line.startswith("CA: ")]
             variants[name] = {
                 "nar": nar,
                 "unsigned": base,
-                "untrusted": base + [sig["untrusted.example.org-1"]],
-                "trusted": base + [sig["builder.example.org-1"]],
+                "untrusted": head + [sig["untrusted.example.org-1"]] + ca,
+                "trusted": head + [sig["builder.example.org-1"]] + ca,
             }
             for kind in ("unsigned", "untrusted", "trusted"):
                 text = "\n".join(variants[name][kind]) + "\n"
