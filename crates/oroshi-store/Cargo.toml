@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+oroshi-nix = { path = "../oroshi-nix" }
 rusqlite = "0.32"
 sha2 = "0.10"
 

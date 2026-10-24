@@ -519,6 +519,7 @@ dependencies = [
 name = "oroshi-store"
 version = "0.1.0"
 dependencies = [
+ "oroshi-nix",
  "rusqlite",
  "sha2",
  "tempfile",

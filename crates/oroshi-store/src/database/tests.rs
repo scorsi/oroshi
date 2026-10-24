@@ -254,3 +254,247 @@ fn invalid_database_directory_returns_a_filesystem_error() {
         Err(DatabaseError::Io(_))
     ));
 }
+
+fn libiconv() -> NarInfo {
+    include_str!(
+        "../../../oroshi-nix/tests/fixtures/narinfo/cache-np8ldxalhj7qkmmf3p5gxx2d9nnm5q3x.narinfo"
+    )
+    .parse()
+    .unwrap()
+}
+
+fn hello() -> NarInfo {
+    include_str!(
+        "../../../oroshi-nix/tests/fixtures/narinfo/cache-f6ivp5fiw1nwq690548fb9qr8p968mj5.narinfo"
+    )
+    .parse()
+    .unwrap()
+}
+
+fn register_nar(database: &Database, info: &NarInfo) {
+    let writer = database.writer().unwrap();
+    writer
+        .execute(
+            "INSERT INTO blob (sha256, size, created_at) VALUES (?1, ?2, 1000)",
+            rusqlite::params![info.file_hash.unwrap(), info.file_size.unwrap()],
+        )
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO nar (url, blob_sha256) VALUES (?1, ?2)",
+            rusqlite::params![info.url, info.file_hash.unwrap()],
+        )
+        .unwrap();
+}
+
+fn stored_paths(database: &Database) -> Vec<String> {
+    database
+        .reader()
+        .unwrap()
+        .prepare("SELECT store_path FROM narinfo ORDER BY store_path")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn edges(database: &Database) -> Vec<(String, String)> {
+    database
+        .reader()
+        .unwrap()
+        .prepare("SELECT referrer, reference FROM reference ORDER BY referrer, reference")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn assert_constraint(error: DatabaseError) {
+    let DatabaseError::Sqlite(error) = error else {
+        panic!("expected SQLite constraint failure, got {error}");
+    };
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ConstraintViolation)
+    );
+}
+
+#[test]
+fn absent_reference_refuses_commit_without_leaving_a_narinfo_or_edges() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let info = hello();
+    register_nar(&database, &info);
+    assert_constraint(database.commit_narinfo(&info, "upload", 2000).unwrap_err());
+    assert!(stored_paths(&database).is_empty());
+    assert!(edges(&database).is_empty());
+    assert!(database.writer().unwrap().is_autocommit());
+}
+
+#[test]
+fn self_reference_commits_content_nar_blob_link_and_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let info = libiconv();
+    register_nar(&database, &info);
+    database.commit_narinfo(&info, "upload", 2000).unwrap();
+    assert_eq!(
+        stored_paths(&database),
+        std::slice::from_ref(&info.store_path)
+    );
+    assert_eq!(
+        edges(&database),
+        [(info.store_path.clone(), info.store_path.clone())]
+    );
+    let stored: (String, String, String, i64, Vec<u8>) = database
+        .reader()
+        .unwrap()
+        .query_row(
+            "SELECT store_hash, content, source, last_accessed_at, blob.sha256
+             FROM narinfo JOIN nar ON nar.url = narinfo.nar_url
+             JOIN blob ON blob.sha256 = nar.blob_sha256",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(stored.0, parse_store_path(&info.store_path).unwrap().hash);
+    assert_eq!(stored.1.parse::<NarInfo>().unwrap(), info);
+    assert_eq!(stored.2, "upload");
+    assert_eq!(stored.3, 2000);
+    assert_eq!(stored.4, info.file_hash.unwrap());
+}
+
+#[test]
+fn dependency_order_allows_a_chain_and_survives_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let dependency = libiconv();
+    let dependent = hello();
+    register_nar(&database, &dependency);
+    register_nar(&database, &dependent);
+    database
+        .commit_narinfo(&dependency, "upload", 2000)
+        .unwrap();
+    database.commit_narinfo(&dependent, "upload", 2001).unwrap();
+    drop(database);
+    let database = Database::open(root.path()).unwrap();
+    assert_eq!(
+        stored_paths(&database),
+        [dependent.store_path.clone(), dependency.store_path.clone()]
+    );
+    assert_eq!(
+        edges(&database),
+        [
+            (dependent.store_path, dependency.store_path.clone()),
+            (dependency.store_path.clone(), dependency.store_path),
+        ]
+    );
+}
+
+#[test]
+fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let dependency = libiconv();
+    let mut dependent = hello();
+    dependent.references.insert(dependent.store_path.clone());
+    register_nar(&database, &dependency);
+    register_nar(&database, &dependent);
+    database
+        .commit_narinfo(&dependency, "upload", 2000)
+        .unwrap();
+    // Fail on the second edge only after the first edge has actually been inserted.
+    database
+        .writer()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_second_edge BEFORE INSERT ON reference
+         WHEN NEW.referrer != NEW.reference AND EXISTS (
+             SELECT 1 FROM reference WHERE referrer = NEW.referrer AND reference = NEW.referrer
+         ) BEGIN SELECT RAISE(ABORT, 'injected constraint failure'); END;",
+        )
+        .unwrap();
+    assert_constraint(
+        database
+            .commit_narinfo(&dependent, "upload", 2001)
+            .unwrap_err(),
+    );
+    assert_eq!(
+        stored_paths(&database),
+        std::slice::from_ref(&dependency.store_path)
+    );
+    assert_eq!(
+        edges(&database),
+        [(dependency.store_path.clone(), dependency.store_path)]
+    );
+    assert!(database.writer().unwrap().is_autocommit());
+    database
+        .writer()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_second_edge")
+        .unwrap();
+    database.commit_narinfo(&dependent, "upload", 2001).unwrap();
+    assert_eq!(edges(&database).len(), 3);
+}
+
+#[test]
+fn absent_nar_refuses_commit_without_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    assert_constraint(
+        database
+            .commit_narinfo(&libiconv(), "upload", 2000)
+            .unwrap_err(),
+    );
+    assert!(stored_paths(&database).is_empty());
+    assert!(edges(&database).is_empty());
+}
+
+#[test]
+fn duplicate_path_never_overwrites_existing_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let info = libiconv();
+    register_nar(&database, &info);
+    database.commit_narinfo(&info, "upload", 2000).unwrap();
+    let mut changed = info.clone();
+    changed.nar_size += 1;
+    assert_constraint(
+        database
+            .commit_narinfo(&changed, "other", 3000)
+            .unwrap_err(),
+    );
+    let content: String = database
+        .reader()
+        .unwrap()
+        .query_row("SELECT content FROM narinfo", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(content.parse::<NarInfo>().unwrap(), info);
+    assert_eq!(
+        edges(&database),
+        [(info.store_path.clone(), info.store_path)]
+    );
+}
+
+#[test]
+fn invalid_store_path_returns_an_error_without_writing() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let mut info = libiconv();
+    info.store_path = "/nix/store/invalid".into();
+    assert!(matches!(
+        database.commit_narinfo(&info, "upload", 2000),
+        Err(DatabaseError::InvalidStorePath(_))
+    ));
+    assert!(stored_paths(&database).is_empty());
+}

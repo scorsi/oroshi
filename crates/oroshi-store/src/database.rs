@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use oroshi_nix::{NarInfo, ParseError, parse_store_path};
 use rusqlite::{Connection, OpenFlags};
 
 const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
@@ -12,6 +13,7 @@ const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
 pub enum DatabaseError {
     Io(io::Error),
     Sqlite(rusqlite::Error),
+    InvalidStorePath(ParseError),
     UnsupportedSchema { found: i64, supported: usize },
     WriterPoisoned,
 }
@@ -21,6 +23,7 @@ impl fmt::Display for DatabaseError {
         match self {
             Self::Io(error) => write!(f, "database filesystem error: {error}"),
             Self::Sqlite(error) => write!(f, "database SQLite error: {error}"),
+            Self::InvalidStorePath(error) => write!(f, "invalid narinfo store path: {error}"),
             Self::UnsupportedSchema { found, supported } => write!(
                 f,
                 "unsupported database schema version {found}; binary supports versions 0..={supported}"
@@ -35,6 +38,7 @@ impl std::error::Error for DatabaseError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
+            Self::InvalidStorePath(error) => Some(error),
             _ => None,
         }
     }
@@ -77,6 +81,37 @@ impl Database {
             path,
             writer: Mutex::new(writer),
         })
+    }
+
+    /// Commit a parsed narinfo, its existing NAR link and all reference edges atomically.
+    /// The NAR must already be registered by its upload. Foreign keys refuse absent
+    /// dependencies; inserting the narinfo first permits its self-edge (ADR 0005).
+    /// Existing paths are refused; validation and signature merge belong to O1 task 11.
+    /// `accessed_at` is Unix time in seconds.
+    pub fn commit_narinfo(
+        &self,
+        info: &NarInfo,
+        source: &str,
+        accessed_at: i64,
+    ) -> Result<(), DatabaseError> {
+        let path = parse_store_path(&info.store_path).map_err(DatabaseError::InvalidStorePath)?;
+        let mut writer = self.writer()?;
+        let transaction = writer.transaction()?;
+        transaction.execute(
+            "INSERT INTO narinfo (store_path, store_hash, nar_url, content, source, last_accessed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                info.store_path, path.hash, info.url, info.to_string(), source, accessed_at
+            ],
+        )?;
+        for reference in &info.references {
+            transaction.execute(
+                "INSERT INTO reference (referrer, reference) VALUES (?1, ?2)",
+                rusqlite::params![info.store_path, reference],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Serialize writes through the store's sole writer connection.
