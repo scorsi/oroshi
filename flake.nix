@@ -42,8 +42,15 @@
 
       imports = [ inputs.treefmt-nix.flakeModule ];
 
+      flake.nixosModules.default = import ./nix/module.nix inputs.self;
+
       perSystem =
-        { pkgs, lib, ... }:
+        {
+          pkgs,
+          lib,
+          system,
+          ...
+        }:
         let
           craneLib = inputs.crane.mkLib pkgs;
           oroshi = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
@@ -89,6 +96,15 @@
                 done
                 touch "$out"
               '';
+          }
+          // import ./nix/module-checks.nix {
+            inherit
+              inputs
+              pkgs
+              oroshi
+              system
+              ;
+            self = inputs.self;
           };
 
           treefmt = {
