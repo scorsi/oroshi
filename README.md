@@ -39,6 +39,8 @@ Content-addressed blob storage (0004), retention and garbage collection (0005), 
 
 ## Testing
 
+See [Nix cache usage](docs/usage.md) for client, uploader and internal TLS proxy configuration.
+
 `nixosTest` per module, using the real clients: `nix copy` / substituters, `go`, `cargo`, `mix`, `pnpm`.
 
 ## Roadmap
