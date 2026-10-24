@@ -498,3 +498,128 @@ fn invalid_store_path_returns_an_error_without_writing() {
     ));
     assert!(stored_paths(&database).is_empty());
 }
+
+fn last_access(database: &Database, store_hash: &str) -> i64 {
+    database
+        .reader()
+        .unwrap()
+        .query_row(
+            "SELECT last_accessed_at FROM narinfo WHERE store_hash = ?1",
+            [store_hash],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn reads_record_access_and_share_an_hourly_limit_between_narinfo_and_nar() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    seed(&database.writer().unwrap());
+    let hash = "00000000000000000000000000000000";
+    let url = "nar/example.nar.zst";
+
+    // Upload initializes access time, so reads within its first hour are batched too.
+    assert_eq!(database.record_narinfo_access(hash, 4599).unwrap(), 0);
+    assert_eq!(last_access(&database, hash), 1000);
+    assert_eq!(database.record_narinfo_access(hash, 5000).unwrap(), 1);
+    assert_eq!(last_access(&database, hash), 5000);
+    let writes = database.writer().unwrap().total_changes();
+    assert_eq!(database.record_narinfo_access(hash, 5001).unwrap(), 0);
+    assert_eq!(database.record_nar_access(url, 8599).unwrap(), 0);
+    assert_eq!(database.writer().unwrap().total_changes(), writes);
+    assert_eq!(last_access(&database, hash), 5000);
+
+    assert_eq!(database.record_nar_access(url, 8600).unwrap(), 1);
+    assert_eq!(last_access(&database, hash), 8600);
+    assert_eq!(database.record_narinfo_access(hash, 12199).unwrap(), 0);
+    assert_eq!(database.record_narinfo_access(hash, 12201).unwrap(), 1);
+    assert_eq!(last_access(&database, hash), 12201);
+}
+
+#[test]
+fn access_batching_survives_restart_and_ignores_backwards_time_and_missing_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    seed(&database.writer().unwrap());
+    let hash = "00000000000000000000000000000000";
+    let url = "nar/example.nar.zst";
+    assert_eq!(database.record_narinfo_access(hash, 5000).unwrap(), 1);
+    drop(database);
+
+    let database = Database::open(root.path()).unwrap();
+    for now in [i64::MIN, 4999, 5000, 8599] {
+        assert_eq!(database.record_narinfo_access(hash, now).unwrap(), 0);
+        assert_eq!(database.record_nar_access(url, now).unwrap(), 0);
+    }
+    assert_eq!(database.record_narinfo_access("missing", 8600).unwrap(), 0);
+    assert_eq!(database.record_nar_access("nar/missing", 8600).unwrap(), 0);
+    assert_eq!(database.writer().unwrap().total_changes(), 0);
+    assert_eq!(last_access(&database, hash), 5000);
+    assert_eq!(database.record_nar_access(url, 8600).unwrap(), 1);
+    assert_eq!(last_access(&database, hash), 8600);
+}
+
+#[test]
+fn accesses_to_different_entries_are_independent() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    let dependency = libiconv();
+    let dependent = hello();
+    for info in [&dependency, &dependent] {
+        register_nar(&database, info);
+        database.commit_narinfo(info, "upload", 1000).unwrap();
+    }
+    let dependency_hash = parse_store_path(&dependency.store_path).unwrap().hash;
+    let dependent_hash = parse_store_path(&dependent.store_path).unwrap().hash;
+    assert_eq!(
+        database
+            .record_narinfo_access(dependency_hash, 5000)
+            .unwrap(),
+        1
+    );
+    assert_eq!(last_access(&database, dependency_hash), 5000);
+    assert_eq!(last_access(&database, dependent_hash), 1000);
+    assert_eq!(database.record_nar_access(&dependent.url, 5001).unwrap(), 1);
+    assert_eq!(last_access(&database, dependent_hash), 5001);
+    assert_eq!(last_access(&database, dependency_hash), 5000);
+    assert_eq!(
+        database.record_nar_access(&dependency.url, 5002).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn nar_reads_update_each_linked_entry_only_when_due() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    seed(&database.writer().unwrap());
+    database
+        .writer()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO narinfo
+             SELECT '/nix/store/11111111111111111111111111111111-other',
+                    '11111111111111111111111111111111', nar_url, content, source, 2000
+             FROM narinfo;",
+        )
+        .unwrap();
+    let first = "00000000000000000000000000000000";
+    let second = "11111111111111111111111111111111";
+    assert_eq!(
+        database
+            .record_nar_access("nar/example.nar.zst", 4600)
+            .unwrap(),
+        1
+    );
+    assert_eq!(last_access(&database, first), 4600);
+    assert_eq!(last_access(&database, second), 2000);
+    assert_eq!(
+        database
+            .record_nar_access("nar/example.nar.zst", 5600)
+            .unwrap(),
+        1
+    );
+    assert_eq!(last_access(&database, first), 4600);
+    assert_eq!(last_access(&database, second), 5600);
+}

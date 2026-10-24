@@ -114,6 +114,31 @@ impl Database {
         Ok(())
     }
 
+    /// Record a narinfo read by store hash, returning the number of updated rows.
+    /// `now` is Unix time in seconds. The persisted timestamp (initially the
+    /// upload time) limits updates to once per hour, including across restarts.
+    pub fn record_narinfo_access(
+        &self,
+        store_hash: &str,
+        now: i64,
+    ) -> Result<usize, DatabaseError> {
+        Ok(self.writer()?.execute(
+            "UPDATE narinfo SET last_accessed_at = ?2
+             WHERE store_hash = ?1 AND ?2 - last_accessed_at >= 3600",
+            rusqlite::params![store_hash, now],
+        )?)
+    }
+
+    /// Record a NAR read for every linked narinfo, with the same per-entry limit.
+    /// `now` is Unix time in seconds; absent URLs update no rows.
+    pub fn record_nar_access(&self, nar_url: &str, now: i64) -> Result<usize, DatabaseError> {
+        Ok(self.writer()?.execute(
+            "UPDATE narinfo SET last_accessed_at = ?2
+             WHERE nar_url = ?1 AND ?2 - last_accessed_at >= 3600",
+            rusqlite::params![nar_url, now],
+        )?)
+    }
+
     /// Serialize writes through the store's sole writer connection.
     pub fn writer(&self) -> Result<MutexGuard<'_, Connection>, DatabaseError> {
         self.writer
