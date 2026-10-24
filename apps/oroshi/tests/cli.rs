@@ -206,7 +206,7 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
     let config = directory.0.join("config.toml");
     std::fs::write(
         &config,
-        "[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:0'\n",
+        format!("[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:0'\n[storage]\ndir = '{}'\n", directory.0.join("state").display()),
     )
     .unwrap();
     for signal in ["-TERM", "-INT"] {

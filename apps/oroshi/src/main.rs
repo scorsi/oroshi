@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 mod log;
 pub mod metrics;
+mod nix;
 mod server;
 
 use std::ffi::{OsStr, OsString};
@@ -81,7 +82,7 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
                 server::Server::bind(&config)
                     .await
                     .map_err(|error| error.to_string())?
-                    .run()
+                    .run(&config)
                     .await
                     .map_err(|error| error.to_string())?;
             }

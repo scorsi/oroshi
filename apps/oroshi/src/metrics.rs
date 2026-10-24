@@ -25,7 +25,7 @@ const MODULES: [Module; 6] = [
     Module::Other,
 ];
 impl Module {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         ["nix", "go", "cargo", "hex", "npm", "other"][self as usize]
     }
 }
@@ -49,7 +49,7 @@ impl From<&str> for Method {
     }
 }
 impl Method {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         ["GET", "HEAD", "PUT", "other"][self as usize]
     }
 }

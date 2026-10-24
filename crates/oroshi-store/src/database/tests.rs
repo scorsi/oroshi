@@ -623,3 +623,31 @@ fn nar_reads_update_each_linked_entry_only_when_due() {
     assert_eq!(last_access(&database, first), 4600);
     assert_eq!(last_access(&database, second), 5600);
 }
+
+#[test]
+fn read_lookups_resolve_registered_content_and_blob_and_return_none_on_miss() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap();
+    seed(&database.writer().unwrap());
+    assert_eq!(
+        database
+            .narinfo("00000000000000000000000000000000")
+            .unwrap()
+            .as_deref(),
+        Some("narinfo content")
+    );
+    assert_eq!(
+        database.nar_blob("nar/example.nar.zst").unwrap(),
+        Some(crate::Blob {
+            hash: [0; 32],
+            size: 123
+        })
+    );
+    assert_eq!(
+        database
+            .narinfo("11111111111111111111111111111111")
+            .unwrap(),
+        None
+    );
+    assert_eq!(database.nar_blob("nar/missing.nar").unwrap(), None);
+}

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::body::HttpBody;
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -37,7 +38,18 @@ impl Server {
         Ok(Self { main, metrics })
     }
 
-    pub async fn run(self) -> io::Result<()> {
+    pub async fn run(self, config: &Config) -> io::Result<()> {
+        let root = config.storage.dir.clone();
+        let priority = config.nix.priority;
+        let store = tokio::task::spawn_blocking(move || {
+            Ok::<_, io::Error>(Arc::new(crate::nix::Store {
+                blobs: oroshi_store::BlobStore::open(&root)?,
+                database: oroshi_store::Database::open(&root).map_err(io::Error::other)?,
+                priority,
+            }))
+        })
+        .await
+        .map_err(io::Error::other)??;
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
         let shutdown = async move {
@@ -47,13 +59,7 @@ impl Server {
             }
         };
         let registry = Arc::new(Registry::new());
-        let app = Router::new()
-            .route("/healthz", get(|| async { StatusCode::OK }))
-            .fallback(|| async { StatusCode::NOT_FOUND })
-            .layer(middleware::from_fn_with_state(
-                registry.clone(),
-                count_request,
-            ));
+        let app = app(store, registry.clone(), config.log.access);
         self.serve(app, registry, shutdown, std::env::var_os("NOTIFY_SOCKET"))
             .await
     }
@@ -119,23 +125,71 @@ fn notify(socket: Option<&OsStr>, state: &str) -> io::Result<()> {
     datagram.send_to(state.as_bytes(), socket).map(|_| ())
 }
 
+fn app(store: Arc<crate::nix::Store>, registry: Arc<Registry>, access: bool) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { StatusCode::OK }))
+        .nest("/nix", crate::nix::routes(store))
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn_with_state(
+            (registry, access),
+            count_request,
+        ))
+}
+
 async fn count_request(
-    State(registry): State<Arc<Registry>>,
+    State((registry, access)): State<(Arc<Registry>, bool)>,
     request: Request,
     next: Next,
 ) -> Response {
     let method = Method::from(request.method().as_str());
+    let read = matches!(request.method().as_str(), "GET" | "HEAD");
+    let path = request.uri().path().to_owned();
+    let module = if request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|matched| matched.as_str().starts_with("/nix/"))
+    {
+        Module::Nix
+    } else {
+        Module::Other
+    };
     let start = Instant::now();
     let response = next.run(request).await;
-    // O0 has only health and fallback routes, both in the other module.
     registry
         .requests(
-            Module::Other,
+            module,
             method,
             Code::try_from(response.status().as_u16()).unwrap(),
         )
         .add(1);
-    registry.duration(Module::Other).observe(start.elapsed());
+    registry.duration(module).observe(start.elapsed());
+    let bytes = if matches!(method, Method::Head) {
+        0
+    } else {
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| response.body().size_hint().exact())
+            .unwrap_or(0)
+    };
+    registry.response_bytes(module).add(bytes);
+    if access
+        || !read
+        || (response.status().is_client_error() && response.status() != StatusCode::NOT_FOUND)
+        || response.status().is_server_error()
+    {
+        tracing::info!(
+            event = "request",
+            module = module.label(),
+            method = method.label(),
+            path,
+            status = response.status().as_u16(),
+            bytes,
+            dur_us = start.elapsed().as_micros() as u64
+        );
+    }
     response
 }
 
@@ -280,11 +334,14 @@ mod tests {
 
     #[tokio::test]
     async fn health_fallback_and_metrics_share_request_counts() {
-        let server = Server::bind(&config(true)).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = config(true);
+        settings.storage.dir = directory.path().to_owned();
+        let server = Server::bind(&settings).await.unwrap();
         let main = server.main.local_addr().unwrap();
         let metrics = server.metrics.as_ref().unwrap().local_addr().unwrap();
         assert_ne!(main, metrics);
-        let _running = Running(tokio::spawn(server.run()));
+        let _running = Running(tokio::spawn(async move { server.run(&settings).await }));
         let before = request(metrics, "GET", "/metrics").await;
         assert!(before.starts_with("HTTP/1.1 200"));
         assert!(before.contains(&format!("content-type: {}\r\n", metrics::CONTENT_TYPE)));
@@ -307,7 +364,7 @@ mod tests {
                 .starts_with("HTTP/1.1 200")
         );
         let after = request(metrics, "GET", "/metrics").await;
-        assert!(after.contains(&format!("{counter} 3\n")));
+        assert!(after.contains(&format!("{counter} 2\n")));
         assert!(
             after.contains(
                 "oroshi_requests_total{module=\"other\",method=\"GET\",code=\"2xx\"} 1\n"
@@ -323,7 +380,7 @@ mod tests {
                 "oroshi_requests_total{module=\"other\",method=\"other\",code=\"4xx\"} 1\n"
             )
         );
-        assert!(after.contains("oroshi_request_duration_seconds_count{module=\"other\"} 6\n"));
+        assert!(after.contains("oroshi_request_duration_seconds_count{module=\"other\"} 5\n"));
         assert!(
             request(metrics, "GET", "/healthz")
                 .await
@@ -333,10 +390,13 @@ mod tests {
 
     #[tokio::test]
     async fn absent_metrics_configuration_binds_only_main_listener() {
-        let server = Server::bind(&config(false)).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = config(false);
+        settings.storage.dir = directory.path().to_owned();
+        let server = Server::bind(&settings).await.unwrap();
         assert!(server.metrics.is_none());
         let main = server.main.local_addr().unwrap();
-        let _running = Running(tokio::spawn(server.run()));
+        let _running = Running(tokio::spawn(async move { server.run(&settings).await }));
         assert!(
             request(main, "GET", "/healthz")
                 .await
@@ -360,3 +420,6 @@ mod tests {
         assert!(Server::bind(&config).await.is_err());
     }
 }
+
+#[cfg(test)]
+mod read_tests;

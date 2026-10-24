@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use oroshi_nix::{NarInfo, ParseError, parse_store_path};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+
+use crate::Blob;
 
 const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
 
@@ -112,6 +114,36 @@ impl Database {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Fetch the wire content serialized by `NarInfo` at commit time.
+    pub fn narinfo(&self, store_hash: &str) -> Result<Option<String>, DatabaseError> {
+        Ok(self
+            .reader()?
+            .query_row(
+                "SELECT content FROM narinfo WHERE store_hash = ?1",
+                [store_hash],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Resolve a registered NAR URL to its immutable blob and stored size.
+    pub fn nar_blob(&self, url: &str) -> Result<Option<Blob>, DatabaseError> {
+        Ok(self
+            .reader()?
+            .query_row(
+                "SELECT blob.sha256, blob.size FROM nar JOIN blob ON nar.blob_sha256 = blob.sha256
+             WHERE nar.url = ?1",
+                [url],
+                |row| {
+                    Ok(Blob {
+                        hash: row.get(0)?,
+                        size: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Record a narinfo read by store hash, returning the number of updated rows.
