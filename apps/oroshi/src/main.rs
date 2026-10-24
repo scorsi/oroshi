@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+mod log;
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -27,23 +28,35 @@ fn command(args: &[OsString]) -> Result<Command, &'static str> {
     }
 }
 
-fn run(args: &[OsString]) -> Result<(), String> {
+fn run(args: &[OsString]) -> Result<ExitCode, String> {
     match command(args)? {
         Command::Version => println!("oroshi {}", env!("CARGO_PKG_VERSION")),
         Command::ConfigCheck(path) => {
-            let input = std::fs::read_to_string(&path)
-                .map_err(|error| format!("config {}: {error}", path.display()))?;
-            config::Config::parse(&input)?;
+            let result = (|| {
+                let input = std::fs::read_to_string(&path)
+                    .map_err(|error| format!("config {}: {error}", path.display()))?;
+                config::Config::parse(&input)
+            })();
+            let config = match result {
+                Ok(config) => config,
+                Err(error) => {
+                    log::error("config-invalid", &error);
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            log::init(&config.log.level)?;
+            tracing::info!(event = "start", version = env!("CARGO_PKG_VERSION"));
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn main() -> ExitCode {
+    log::install_panic_hook();
     match run(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
-            eprintln!("{error}");
+            log::error("fatal", &error);
             ExitCode::FAILURE
         }
     }

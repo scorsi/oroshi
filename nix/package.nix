@@ -10,6 +10,7 @@ let
       fileset = lib.fileset.unions [
         (craneLib.fileset.commonCargoSources ../.)
         ./example.toml
+        ../apps/oroshi/tests/fixtures
       ];
     };
   };

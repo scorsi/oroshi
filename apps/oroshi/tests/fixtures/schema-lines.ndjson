@@ -1,0 +1,11 @@
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"proto\":\"udp\",\"client\":\"203.0.113.9\",\"qname\":\"example.org.\",\"qtype\":\"SOA\",\"rcode\":\"NOERROR\",\"aa\":true,\"cache\":\"none\",\"size\":112,\"dur_us\":38}","valid":true,"reason":""}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"warning\",\"event\":\"query\"}","valid":false,"reason":"level-format"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"error\",\"event\":\"query\",\"err\":null}","valid":false,"reason":"err-format"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"node\":\"node-a\"}","valid":false,"reason":"reserved-field:node"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"service\":\"annai\"}","valid":false,"reason":"reserved-field:service"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"stream\":\"9b1e0c5d7a2f4e8b9c0d1e2f3a4b5c6d\"}","valid":false,"reason":"reserved-field:stream"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"seq\":1}","valid":false,"reason":"reserved-field:seq"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"source\":\"journald\"}","valid":false,"reason":"reserved-field:source"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"recv_ts\":\"2026-10-19T08:14:03.512004117Z\"}","valid":false,"reason":"reserved-field:recv_ts"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"err\":\"connection refused\"}","valid":false,"reason":"err-format"}
+{"input":"{\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"query\",\"_cursor\":\"s=1\"}","valid":false,"reason":"reserved-field:_cursor"}

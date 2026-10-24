@@ -129,6 +129,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        crate::log::filter(&self.log.level, None)?;
         if let Some(listen) = self.metrics.listen
             && !listen.ip().is_loopback()
         {
