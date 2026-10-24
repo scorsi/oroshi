@@ -59,7 +59,7 @@ impl Server {
             }
         };
         let registry = Arc::new(Registry::new());
-        let app = app(store, registry.clone(), config.log.access);
+        let app = app(store, registry.clone(), config);
         self.serve(app, registry, shutdown, std::env::var_os("NOTIFY_SOCKET"))
             .await
     }
@@ -125,13 +125,19 @@ fn notify(socket: Option<&OsStr>, state: &str) -> io::Result<()> {
     datagram.send_to(state.as_bytes(), socket).map(|_| ())
 }
 
-fn app(store: Arc<crate::nix::Store>, registry: Arc<Registry>, access: bool) -> Router {
+fn app(store: Arc<crate::nix::Store>, registry: Arc<Registry>, config: &Config) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
-        .nest("/nix", crate::nix::routes(store))
+        .nest(
+            "/nix",
+            crate::nix::routes(
+                store,
+                Arc::new(crate::auth::Tokens::new(config, "nix:write")),
+            ),
+        )
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn_with_state(
-            (registry, access),
+            (registry, config.log.access),
             count_request,
         ))
 }
@@ -423,3 +429,6 @@ mod tests {
 
 #[cfg(test)]
 mod read_tests;
+
+#[cfg(test)]
+mod upload_tests;

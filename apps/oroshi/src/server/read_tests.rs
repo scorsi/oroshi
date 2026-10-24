@@ -49,7 +49,9 @@ async fn anonymous_http_reads_head_fallbacks_metrics_and_quiet_logging() {
         let registry = Arc::new(Registry::new());
         let events = Events(Arc::default());
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(events.clone()));
-        let app = app(store.clone(), registry.clone(), access);
+        let mut config = Config::default();
+        config.log.access = access;
+        let app = app(store.clone(), registry.clone(), &config);
         let cases = [
             (
                 "GET",
@@ -148,7 +150,7 @@ async fn storage_failures_are_logged_even_with_quiet_reads() {
     let registry = Arc::new(Registry::new());
     let events = Events(Arc::default());
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(events.clone()));
-    let app = app(store, registry.clone(), false);
+    let app = app(store, registry.clone(), &Config::default());
     std::fs::remove_dir_all(root.path().join("blobs")).unwrap();
     let (response, _) = request(app, "GET", &format!("/nix/{}", info.url))
         .with_subscriber(dispatch)

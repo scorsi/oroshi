@@ -1,9 +1,11 @@
-//! Anonymous Nix cache reads (ADR 0006).
+//! Nix cache HTTP routes (ADR 0006).
+use std::io::{self, Read};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -12,14 +14,23 @@ use oroshi_nix::{decode_base32, parse_sha256};
 use oroshi_store::{BlobStore, Database};
 use tokio_util::io::ReaderStream;
 
+use crate::auth::{self, Tokens};
+
 pub struct Store {
     pub blobs: BlobStore,
     pub database: Database,
     pub priority: u32,
 }
 
-pub fn routes(store: Arc<Store>) -> Router {
+pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>) -> Router {
     Router::new()
+        .route(
+            "/nar/:file",
+            axum::routing::put(put_nar).route_layer(axum::middleware::from_fn_with_state(
+                tokens,
+                auth::require_scope,
+            )),
+        )
         .route("/nix-cache-info", get(cache_info))
         .route("/:name", get(narinfo))
         .route("/nar/:file", get(nar))
@@ -71,11 +82,7 @@ async fn nar(
     Path(file): Path<String>,
     method: Method,
 ) -> Result<Response, StatusCode> {
-    let stem = [".nar", ".nar.xz", ".nar.zst", ".nar.bz2"]
-        .iter()
-        .find_map(|suffix| file.strip_suffix(suffix))
-        .ok_or(StatusCode::NOT_FOUND)?;
-    parse_sha256(&format!("sha256:{stem}")).map_err(|_| StatusCode::NOT_FOUND)?;
+    file_hash(&file).ok_or(StatusCode::NOT_FOUND)?;
     let (file, size) = tokio::task::spawn_blocking(move || {
         let url = format!("nar/{file}");
         let blob = store
@@ -109,6 +116,71 @@ async fn nar(
         body,
     )
         .into_response())
+}
+
+fn file_hash(file: &str) -> Option<[u8; 32]> {
+    let stem = [".nar", ".nar.xz", ".nar.zst", ".nar.bz2"]
+        .iter()
+        .find_map(|suffix| file.strip_suffix(suffix))?;
+    parse_sha256(&format!("sha256:{stem}")).ok()
+}
+
+// Poll only the next body frame when the synchronous blob writer needs bytes.
+struct UploadReader {
+    body: Body,
+    chunk: Bytes,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Read for UploadReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        while self.chunk.is_empty() {
+            let frame = self.runtime.block_on(std::future::poll_fn(|cx| {
+                Pin::new(&mut self.body).poll_frame(cx)
+            }));
+            let Some(frame) = frame else { return Ok(0) };
+            let frame =
+                frame.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if let Ok(data) = frame.into_data() {
+                self.chunk = data;
+            }
+        }
+        let length = buffer.len().min(self.chunk.len());
+        buffer[..length].copy_from_slice(&self.chunk.split_to(length));
+        Ok(length)
+    }
+}
+
+async fn put_nar(
+    State(store): State<Arc<Store>>,
+    Path(file): Path<String>,
+    body: Body,
+) -> Result<StatusCode, StatusCode> {
+    let hash = file_hash(&file).ok_or(StatusCode::FORBIDDEN)?;
+    let reader = UploadReader {
+        body,
+        chunk: Bytes::new(),
+        runtime: tokio::runtime::Handle::current(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let blob = store
+            .blobs
+            .write(reader, u64::MAX, Some(&hash))
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            })?;
+        store
+            .database
+            .register_nar(&format!("nar/{file}"), &blob, now()?)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 #[cfg(test)]

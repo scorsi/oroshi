@@ -86,6 +86,30 @@ impl Database {
         })
     }
 
+    /// Register a published blob and its NAR URL atomically; duplicates are no-ops.
+    /// Call only after the blob's hash has been verified against its URL.
+    pub fn register_nar(
+        &self,
+        url: &str,
+        blob: &Blob,
+        created_at: i64,
+    ) -> Result<(), DatabaseError> {
+        let mut writer = self.writer()?;
+        let transaction = writer.transaction()?;
+        transaction.execute(
+            "INSERT INTO blob (sha256, size, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (sha256) DO NOTHING",
+            rusqlite::params![blob.hash.as_slice(), blob.size, created_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO nar (url, blob_sha256) VALUES (?1, ?2)
+             ON CONFLICT (url) DO NOTHING",
+            rusqlite::params![url, blob.hash.as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Commit a parsed narinfo, its existing NAR link and all reference edges atomically.
     /// The NAR must already be registered by its upload. Foreign keys refuse absent
     /// dependencies; inserting the narinfo first permits its self-edge (ADR 0005).
