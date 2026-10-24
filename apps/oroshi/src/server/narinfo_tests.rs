@@ -27,7 +27,7 @@ async fn put(app: Router, info: &NarInfo) -> Response {
     .await
 }
 
-async fn uploaded(app: Router, fixture: &str) -> NarInfo {
+pub(super) async fn uploaded(app: Router, fixture: &str) -> NarInfo {
     let mut info: NarInfo = fixture.parse().unwrap();
     // Replace only unsigned transport fields: the real fixture signatures stay valid.
     let bytes = format!("compressed NAR for {}", info.store_path).into_bytes();

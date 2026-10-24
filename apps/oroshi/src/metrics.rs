@@ -1,4 +1,4 @@
-//! O0 metrics from ADR 0011. Label values are closed enums, never request strings.
+//! Cache metrics from ADR 0011. Label values are closed enums, never request strings.
 use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
@@ -89,6 +89,18 @@ impl Code {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum UploadResult {
+    Committed,
+    Refused,
+}
+const UPLOAD_RESULTS: [UploadResult; 2] = [UploadResult::Committed, UploadResult::Refused];
+impl UploadResult {
+    fn label(self) -> &'static str {
+        ["committed", "refused"][self as usize]
+    }
+}
+
 #[derive(Default)]
 pub struct Counter(AtomicU64);
 impl Counter {
@@ -143,6 +155,11 @@ pub struct Registry {
     requests: [[[Counter; 5]; 4]; 6],
     durations: [Histogram; 6],
     response_bytes: [Counter; 6],
+    upload_bytes: [Counter; 6],
+    uploads: [[Counter; 2]; 6],
+    auth_refusals: [Counter; 6],
+    pub stored_bytes: Gauge,
+    pub blobs: Gauge,
 }
 impl Default for Registry {
     fn default() -> Self {
@@ -156,6 +173,11 @@ impl Registry {
             requests: Default::default(),
             durations: Default::default(),
             response_bytes: Default::default(),
+            upload_bytes: Default::default(),
+            uploads: Default::default(),
+            auth_refusals: Default::default(),
+            stored_bytes: Default::default(),
+            blobs: Default::default(),
         }
     }
 
@@ -169,6 +191,18 @@ impl Registry {
 
     pub fn response_bytes(&self, module: Module) -> &Counter {
         &self.response_bytes[module as usize]
+    }
+
+    pub fn upload_bytes(&self, module: Module) -> &Counter {
+        &self.upload_bytes[module as usize]
+    }
+
+    pub fn uploads(&self, module: Module, result: UploadResult) -> &Counter {
+        &self.uploads[module as usize][result as usize]
+    }
+
+    pub fn auth_refusals(&self, module: Module) -> &Counter {
+        &self.auth_refusals[module as usize]
     }
 
     pub fn exposition(&self) -> String {
@@ -240,6 +274,47 @@ impl Registry {
             )
             .unwrap();
         }
+        out.push_str("# HELP oroshi_upload_bytes_total Committed upload bytes.\n# TYPE oroshi_upload_bytes_total counter\n");
+        for module in MODULES {
+            writeln!(
+                out,
+                "oroshi_upload_bytes_total{{module=\"{}\"}} {}",
+                module.label(),
+                self.upload_bytes(module).get()
+            )
+            .unwrap();
+        }
+        out.push_str(
+            "# HELP oroshi_uploads_total Upload outcomes.\n# TYPE oroshi_uploads_total counter\n",
+        );
+        for module in MODULES {
+            for result in UPLOAD_RESULTS {
+                writeln!(
+                    out,
+                    "oroshi_uploads_total{{module=\"{}\",result=\"{}\"}} {}",
+                    module.label(),
+                    result.label(),
+                    self.uploads(module, result).get()
+                )
+                .unwrap();
+            }
+        }
+        out.push_str("# HELP oroshi_auth_refusals_total Authentication refusals.\n# TYPE oroshi_auth_refusals_total counter\n");
+        for module in MODULES {
+            writeln!(
+                out,
+                "oroshi_auth_refusals_total{{module=\"{}\"}} {}",
+                module.label(),
+                self.auth_refusals(module).get()
+            )
+            .unwrap();
+        }
+        out.push_str(
+            "# HELP oroshi_stored_bytes Registered blob bytes.\n# TYPE oroshi_stored_bytes gauge\n",
+        );
+        writeln!(out, "oroshi_stored_bytes {}", self.stored_bytes.get()).unwrap();
+        out.push_str("# HELP oroshi_blobs Registered blobs.\n# TYPE oroshi_blobs gauge\n");
+        writeln!(out, "oroshi_blobs {}", self.blobs.get()).unwrap();
         out
     }
 }
@@ -255,6 +330,14 @@ mod tests {
             .requests(Module::Other, Method::Get, Code::Success)
             .add(3);
         registry.response_bytes(Module::Other).add(42);
+        registry.upload_bytes(Module::Nix).add(123);
+        registry
+            .uploads(Module::Nix, UploadResult::Committed)
+            .add(2);
+        registry.uploads(Module::Nix, UploadResult::Refused).add(1);
+        registry.auth_refusals(Module::Nix).add(3);
+        registry.stored_bytes.set(100);
+        registry.blobs.set(1);
         registry
             .duration(Module::Other)
             .observe(Duration::from_millis(250));
@@ -281,9 +364,10 @@ mod tests {
         let durations = MODULES.len() * (BOUNDS_MS.len() + 3);
         assert_eq!(requests, 120);
         assert_eq!(durations, 54);
-        assert_eq!(samples, 1 + requests + durations + MODULES.len());
-        // ADR 0011 reserves later upload bytes, uploads, auth, storage and GC families.
-        let later = MODULES.len() + MODULES.len() * 2 + MODULES.len() + 2 + 2 + 2;
+        assert_eq!(samples, 1 + requests + durations + MODULES.len() * 5 + 2);
+        assert_eq!(samples, 207);
+        // ADR 0011 reserves the four GC series for O2.
+        let later = 4;
         assert_eq!(samples + later, 211);
         assert!(samples + later <= 500);
     }

@@ -70,15 +70,23 @@ impl Server {
             }
         };
         let registry = Arc::new(Registry::new());
-        let app = app(store, registry.clone(), config);
-        self.serve(app, registry, shutdown, std::env::var_os("NOTIFY_SOCKET"))
-            .await
+        let app = app(store.clone(), registry.clone(), config);
+        let metrics_app = Router::new()
+            .route("/metrics", get(exposition))
+            .with_state((registry, store));
+        self.serve(
+            app,
+            metrics_app,
+            shutdown,
+            std::env::var_os("NOTIFY_SOCKET"),
+        )
+        .await
     }
 
     async fn serve(
         self,
         app: Router,
-        registry: Arc<Registry>,
+        metrics_app: Router,
         shutdown: impl Future<Output = ()>,
         notify_socket: Option<OsString>,
     ) -> io::Result<()> {
@@ -89,10 +97,7 @@ impl Server {
         });
         let metrics = async move {
             if let Some(listener) = self.metrics {
-                let app = Router::new()
-                    .route("/metrics", get(exposition))
-                    .with_state(registry);
-                axum::serve(listener, app)
+                axum::serve(listener, metrics_app)
                     .with_graceful_shutdown(async move {
                         let _ = metrics_stop.changed().await;
                     })
@@ -143,7 +148,13 @@ fn app(store: Arc<crate::nix::Store>, registry: Arc<Registry>, config: &Config) 
             "/nix/",
             crate::nix::routes(
                 store,
-                Arc::new(crate::auth::Tokens::new(config, "nix:write")),
+                Arc::new(crate::auth::Tokens::new(
+                    config,
+                    "nix:write",
+                    Module::Nix,
+                    registry.clone(),
+                )),
+                registry.clone(),
             ),
         )
         .fallback(|| async { StatusCode::NOT_FOUND })
@@ -192,10 +203,19 @@ async fn count_request(
             .unwrap_or(0)
     };
     registry.response_bytes(module).add(bytes);
-    if access
-        || !read
-        || (response.status().is_client_error() && response.status() != StatusCode::NOT_FOUND)
-        || response.status().is_server_error()
+    let refusal_logged = response
+        .extensions()
+        .get::<crate::auth::AuthRefused>()
+        .is_some()
+        || response
+            .extensions()
+            .get::<crate::nix::UploadRefused>()
+            .is_some();
+    if !refusal_logged
+        && (access
+            || !read
+            || (response.status().is_client_error() && response.status() != StatusCode::NOT_FOUND)
+            || response.status().is_server_error())
     {
         tracing::info!(
             event = "request",
@@ -211,12 +231,29 @@ async fn count_request(
 }
 
 async fn exposition(
-    State(registry): State<Arc<Registry>>,
-) -> ([(header::HeaderName, &'static str); 1], String) {
-    (
-        [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
-        registry.exposition(),
-    )
+    State((registry, store)): State<(Arc<Registry>, Arc<crate::nix::Store>)>,
+) -> Result<([(header::HeaderName, &'static str); 1], String), StatusCode> {
+    tokio::task::spawn_blocking(move || {
+        let (bytes, blobs) = store
+            .database
+            .reader()
+            .and_then(|reader| {
+                Ok(reader.query_row(
+                    "SELECT coalesce(sum(size), 0), count(*) FROM blob",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?)
+            })
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        registry.stored_bytes.set(bytes);
+        registry.blobs.set(blobs);
+        Ok((
+            [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+            registry.exposition(),
+        ))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 #[cfg(test)]
@@ -317,7 +354,7 @@ mod tests {
         let (stop, mut shutdown) = watch::channel(false);
         let mut running = Running(tokio::spawn(server.serve(
             app,
-            Arc::new(Registry::new()),
+            Router::new(),
             async move { shutdown.changed().await.unwrap() },
             None,
         )));
@@ -446,3 +483,6 @@ mod upload_tests;
 
 #[cfg(test)]
 mod narinfo_tests;
+
+#[cfg(test)]
+mod observability_tests;

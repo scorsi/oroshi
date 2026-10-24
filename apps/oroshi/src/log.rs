@@ -199,15 +199,15 @@ fn ts_from(secs: i64, nanos: u32) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    mod schema {
+    pub(crate) mod schema {
         include!("../tests/fixtures/schema.rs");
     }
 
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Capture(pub Arc<Mutex<Vec<u8>>>);
     impl<S: Subscriber> Layer<S> for Capture {
         fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
             if let Some(line) = format(event, &ts_from(0, 0)) {

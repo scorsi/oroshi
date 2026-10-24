@@ -187,3 +187,39 @@ oroshi_response_bytes_total{module="cargo"} 0
 oroshi_response_bytes_total{module="hex"} 0
 oroshi_response_bytes_total{module="npm"} 0
 oroshi_response_bytes_total{module="other"} 42
+# HELP oroshi_upload_bytes_total Committed upload bytes.
+# TYPE oroshi_upload_bytes_total counter
+oroshi_upload_bytes_total{module="nix"} 123
+oroshi_upload_bytes_total{module="go"} 0
+oroshi_upload_bytes_total{module="cargo"} 0
+oroshi_upload_bytes_total{module="hex"} 0
+oroshi_upload_bytes_total{module="npm"} 0
+oroshi_upload_bytes_total{module="other"} 0
+# HELP oroshi_uploads_total Upload outcomes.
+# TYPE oroshi_uploads_total counter
+oroshi_uploads_total{module="nix",result="committed"} 2
+oroshi_uploads_total{module="nix",result="refused"} 1
+oroshi_uploads_total{module="go",result="committed"} 0
+oroshi_uploads_total{module="go",result="refused"} 0
+oroshi_uploads_total{module="cargo",result="committed"} 0
+oroshi_uploads_total{module="cargo",result="refused"} 0
+oroshi_uploads_total{module="hex",result="committed"} 0
+oroshi_uploads_total{module="hex",result="refused"} 0
+oroshi_uploads_total{module="npm",result="committed"} 0
+oroshi_uploads_total{module="npm",result="refused"} 0
+oroshi_uploads_total{module="other",result="committed"} 0
+oroshi_uploads_total{module="other",result="refused"} 0
+# HELP oroshi_auth_refusals_total Authentication refusals.
+# TYPE oroshi_auth_refusals_total counter
+oroshi_auth_refusals_total{module="nix"} 3
+oroshi_auth_refusals_total{module="go"} 0
+oroshi_auth_refusals_total{module="cargo"} 0
+oroshi_auth_refusals_total{module="hex"} 0
+oroshi_auth_refusals_total{module="npm"} 0
+oroshi_auth_refusals_total{module="other"} 0
+# HELP oroshi_stored_bytes Registered blob bytes.
+# TYPE oroshi_stored_bytes gauge
+oroshi_stored_bytes 100
+# HELP oroshi_blobs Registered blobs.
+# TYPE oroshi_blobs gauge
+oroshi_blobs 1

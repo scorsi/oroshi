@@ -1,0 +1,275 @@
+use super::upload_tests::{fixture, request};
+use super::*;
+use crate::log::tests::{Capture, schema};
+use crate::metrics::UploadResult;
+use axum::body::Body;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::sync::Mutex;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
+
+fn config() -> Config {
+    Config::parse(&format!(
+        "[log]\naccess = true\n[tokens.writer]\nsha256 = {:?}\nscopes = ['nix:write']\n\
+         [tokens.reader]\nsha256 = {:?}\nscopes = ['nix:read']\n",
+        format!("{:x}", Sha256::digest(b"secret")),
+        format!("{:x}", Sha256::digest(b"reader-secret")),
+    ))
+    .unwrap()
+}
+
+async fn logged_request(
+    app: Router,
+    path: &str,
+    credential: Option<&str>,
+    body: Body,
+) -> (Response, Vec<Value>, String) {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(bytes.clone()));
+    let response = request(app, "PUT", path, credential, body)
+        .with_subscriber(subscriber)
+        .await;
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let lines = text
+        .lines()
+        .map(|line| {
+            assert!(schema::valid(line), "{line}");
+            serde_json::from_str(line).unwrap()
+        })
+        .collect();
+    (response, lines, text)
+}
+
+fn assert_fields(line: &Value, fields: &[&str]) {
+    let mut expected = vec!["v", "ts", "level", "event"];
+    expected.extend(fields);
+    expected.sort_unstable();
+    let mut actual: Vec<_> = line
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn each_upload_refusal_has_one_schema_line_and_one_counter() {
+    let (_root, store, _) = fixture();
+    let registry = Arc::new(Registry::new());
+    let app = app(store, registry.clone(), &config());
+    // Parser diagnostics must not echo a submitted credential from the body.
+    let cases = [
+        ("/nix/bad.narinfo", "secret body", 400, "narinfo"),
+        ("/nix/nar/bad.nar", "", 403, "nar"),
+        ("/nix/unsupported/path", "", 403, "other"),
+        ("/nix/", "", 403, "other"),
+    ];
+    for (index, (path, body, status, kind)) in cases.into_iter().enumerate() {
+        let (response, lines, text) =
+            logged_request(app.clone(), path, Some("secret"), Body::from(body)).await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(lines.len(), 1, "{text}");
+        let line = &lines[0];
+        assert_fields(line, &["module", "kind", "reason"]);
+        assert_eq!(line["event"], "upload-refused");
+        assert_eq!(line["level"], "warn");
+        assert_eq!(line["module"], "nix");
+        assert_eq!(line["kind"], kind);
+        assert_eq!(line["reason"], response.status().to_string());
+        assert!(!text.contains("secret"), "{text}");
+        assert_eq!(
+            registry.uploads(Module::Nix, UploadResult::Refused).get(),
+            index as u64 + 1
+        );
+        assert_eq!(
+            registry.uploads(Module::Nix, UploadResult::Committed).get(),
+            0
+        );
+        assert_eq!(registry.auth_refusals(Module::Nix).get(), 0);
+        assert_eq!(registry.upload_bytes(Module::Nix).get(), 0);
+    }
+}
+
+#[tokio::test]
+async fn auth_refusals_are_single_lines_and_never_log_token_material() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let (_root, store, _) = fixture();
+    let registry = Arc::new(Registry::new());
+    let app = app(store, registry.clone(), &config());
+    let basic = format!("Basic {}", STANDARD.encode("ignored-user:unknown-secret"));
+    let cases = [
+        (None, 401, "unknown"),
+        (Some("unknown-secret"), 401, "unknown"),
+        (Some("Bearer unknown-secret"), 401, "unknown"),
+        (Some(basic.as_str()), 401, "unknown"),
+        (Some("Basic !!!"), 401, "unknown"),
+        (Some("reader-secret"), 403, "reader"),
+        (Some("Bearer reader-secret"), 403, "reader"),
+        (Some("Basic dXNlcjpyZWFkZXItc2VjcmV0"), 403, "reader"),
+    ];
+    for (index, (credential, status, name)) in cases.into_iter().enumerate() {
+        let (response, lines, text) = logged_request(
+            app.clone(),
+            "/nix/bad.narinfo",
+            credential,
+            Body::from("unknown-secret"),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(
+            response.headers().contains_key(header::WWW_AUTHENTICATE),
+            status == 401
+        );
+        assert_eq!(lines.len(), 1, "{text}");
+        let line = &lines[0];
+        assert_fields(line, &["module", "token"]);
+        assert_eq!(line["event"], "auth-refused");
+        assert_eq!(line["level"], "warn");
+        assert_eq!(line["module"], "nix");
+        assert_eq!(line["token"], name);
+        for material in [
+            "reader-secret",
+            "unknown-secret",
+            "ignored-user",
+            "Bearer",
+            "Basic",
+            "Authorization",
+            "dXNlcjpyZWFkZXItc2VjcmV0",
+            "!!!",
+            basic.as_str(),
+        ] {
+            assert!(!text.contains(material), "{text}");
+        }
+        assert_eq!(registry.auth_refusals(Module::Nix).get(), index as u64 + 1);
+        assert_eq!(
+            registry.uploads(Module::Nix, UploadResult::Refused).get(),
+            0
+        );
+        assert_eq!(
+            registry.uploads(Module::Nix, UploadResult::Committed).get(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn commits_count_actual_bytes_and_scrapes_refresh_deduplicated_database_gauges() {
+    let (root, store, _) = fixture();
+    let registry = Arc::new(Registry::new());
+    let app = app(store.clone(), registry.clone(), &config());
+    let payload = b"compressed NAR";
+    let hash = oroshi_nix::encode_base32(&Sha256::digest(payload));
+    for (index, suffix) in [".nar", ".nar.xz", ".nar"].into_iter().enumerate() {
+        let name = format!("{hash}{suffix}");
+        let (response, lines, text) = logged_request(
+            app.clone(),
+            &format!("/nix/nar/{name}"),
+            Some("Bearer secret"),
+            Body::from(payload.as_slice()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let committed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "upload-committed")
+            .collect();
+        assert_eq!(committed.len(), 1, "{text}");
+        let line = committed[0];
+        assert_fields(line, &["module", "kind", "name", "bytes"]);
+        assert_eq!(line["level"], "info");
+        assert_eq!(line["module"], "nix");
+        assert_eq!(line["kind"], "nar");
+        assert_eq!(line["name"], name);
+        assert_eq!(line["bytes"], payload.len());
+        assert!(!text.contains("secret"));
+        assert_eq!(
+            registry.uploads(Module::Nix, UploadResult::Committed).get(),
+            index as u64 + 1
+        );
+        assert_eq!(
+            registry.upload_bytes(Module::Nix).get(),
+            (index as u64 + 1) * payload.len() as u64
+        );
+    }
+    // A fresh registry and reopened database must expose persisted totals, not process deltas.
+    let reopened = Arc::new(crate::nix::Store {
+        blobs: oroshi_store::BlobStore::open(root.path()).unwrap(),
+        database: oroshi_store::Database::open(root.path()).unwrap(),
+        priority: 30,
+        trusted_keys: Vec::new(),
+        limits: crate::nix::UploadLimits::new(&Config::default()),
+        upload_gate: Arc::default(),
+    });
+    let registry = Arc::new(Registry::new());
+    for expected in [payload.len(), 0] {
+        let (_, text) = exposition(State((registry.clone(), reopened.clone())))
+            .await
+            .unwrap();
+        assert!(
+            text.contains(&format!("oroshi_stored_bytes {expected}\n")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("oroshi_blobs {}\n", usize::from(expected != 0))));
+        if expected != 0 {
+            reopened
+                .database
+                .writer()
+                .unwrap()
+                .execute_batch("DELETE FROM nar; DELETE FROM blob;")
+                .unwrap();
+        }
+    }
+    reopened
+        .database
+        .writer()
+        .unwrap()
+        .execute_batch("DROP TABLE blob;")
+        .unwrap();
+    assert_eq!(
+        exposition(State((registry, reopened))).await.unwrap_err(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn narinfo_commits_log_store_names_and_count_wire_bytes() {
+    let (_root, store, _) = fixture();
+    let registry = Arc::new(Registry::new());
+    let app = app(store, registry.clone(), &config());
+    let info = super::narinfo_tests::uploaded(app.clone(), crate::nix::tests::FIXTURE).await;
+    let wire = info.to_string();
+    for count in 1..=2 {
+        let (response, lines, text) = logged_request(
+            app.clone(),
+            &format!("/nix/{}.narinfo", crate::nix::tests::HASH),
+            Some("secret"),
+            Body::from(wire.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let lines: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "upload-committed")
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let line = lines[0];
+        assert_fields(line, &["module", "kind", "name", "bytes"]);
+        assert_eq!(line["level"], "info");
+        assert_eq!(line["module"], "nix");
+        assert_eq!(line["kind"], "narinfo");
+        assert_eq!(line["name"], info.store_path);
+        assert_eq!(line["bytes"], wire.len());
+        assert!(!text.contains("secret"));
+        assert_eq!(
+            registry.uploads(Module::Nix, UploadResult::Committed).get(),
+            count + 1
+        );
+        assert_eq!(
+            registry.upload_bytes(Module::Nix).get(),
+            info.file_size.unwrap() + count * wire.len() as u64
+        );
+    }
+}

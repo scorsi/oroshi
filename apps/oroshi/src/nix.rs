@@ -4,19 +4,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{Path, Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use oroshi_nix::{NarInfo, PublicKey, decode_base32, parse_sha256, parse_store_path};
 use oroshi_store::{BlobStore, Database, DatabaseError};
 use tokio::time::{Duration, Instant, timeout_at};
 use tokio_util::io::ReaderStream;
 
 use crate::auth::{self, Tokens};
+use crate::metrics::{Module, Registry, UploadResult};
 
 pub struct Store {
     pub blobs: BlobStore,
@@ -62,7 +63,7 @@ impl UploadLimits {
     }
 }
 
-pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>) -> Router {
+pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>, registry: Arc<Registry>) -> Router {
     Router::new()
         .route(
             "/",
@@ -82,8 +83,59 @@ pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>) -> Router {
             }
         })
         .layer(axum::middleware::from_fn(check_encoding))
+        .layer(axum::middleware::from_fn_with_state(
+            registry,
+            observe_upload,
+        ))
         .layer(axum::middleware::from_fn_with_state(tokens, authorize_put))
         .with_state(store)
+}
+
+#[derive(Clone)]
+struct UploadCommitted {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Clone)]
+pub struct UploadRefused;
+
+async fn observe_upload(
+    State(registry): State<Arc<Registry>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() != Method::PUT {
+        return next.run(request).await;
+    }
+    let kind = if request.uri().path().starts_with("/nar/") {
+        "nar"
+    } else if request.uri().path().ends_with(".narinfo") {
+        "narinfo"
+    } else {
+        "other"
+    };
+    let mut response = next.run(request).await;
+    if let Some(committed) = response.extensions().get::<UploadCommitted>() {
+        registry
+            .uploads(Module::Nix, UploadResult::Committed)
+            .add(1);
+        registry.upload_bytes(Module::Nix).add(committed.bytes);
+        tracing::info!(
+            event = "upload-committed",
+            module = "nix",
+            kind,
+            name = committed.name,
+            bytes = committed.bytes
+        );
+    } else if !response.status().is_success() {
+        registry.uploads(Module::Nix, UploadResult::Refused).add(1);
+        // Status text cannot echo credentials or untrusted request body fields.
+        tracing::warn!(event = "upload-refused", module = "nix", kind,
+            reason = %response.status());
+        response.extensions_mut().insert(UploadRefused);
+    }
+    response
 }
 
 async fn authorize_put(
@@ -114,7 +166,7 @@ async fn put_narinfo(
     State(store): State<Arc<Store>>,
     Path(name): Path<String>,
     body: Body,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     let hash = name
         .strip_suffix(".narinfo")
         .ok_or((StatusCode::FORBIDDEN, "unsupported PUT path".into()))?;
@@ -140,6 +192,7 @@ async fn put_narinfo(
             "upload worker failed".into(),
         )
     })??;
+    let size = bytes.len() as u64;
     let body = std::str::from_utf8(&bytes)
         .map_err(|_| (StatusCode::BAD_REQUEST, "narinfo is not UTF-8".into()))?;
     let info: NarInfo = body
@@ -203,7 +256,14 @@ async fn put_narinfo(
                 DatabaseError::MissingReference => failure("missing narinfo reference"),
                 _ => internal(error),
             })?;
-        Ok(StatusCode::OK)
+        Ok((
+            Extension(UploadCommitted {
+                name: info.store_path,
+                bytes: size,
+            }),
+            StatusCode::OK,
+        )
+            .into_response())
     })
     .await
     .map_err(|_| {
@@ -365,7 +425,7 @@ async fn put_nar(
     State(store): State<Arc<Store>>,
     Path(file): Path<String>,
     body: Body,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Response, StatusCode> {
     let hash = file_hash(&file).ok_or(StatusCode::FORBIDDEN)?;
     let reader = UploadReader::new(body, &store.limits);
     // shortcut: serialize capped uploads through registration; reserve bytes if parallel uploads are needed.
@@ -419,7 +479,14 @@ async fn put_nar(
             .database
             .register_nar(&format!("nar/{file}"), &blob, now()?)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(StatusCode::NO_CONTENT)
+        Ok((
+            Extension(UploadCommitted {
+                name: file,
+                bytes: blob.size,
+            }),
+            StatusCode::NO_CONTENT,
+        )
+            .into_response())
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

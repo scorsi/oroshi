@@ -9,33 +9,40 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::metrics::{Module, Registry};
 
 /// Route-specific state for `from_fn_with_state(state, auth::require_scope)`.
 pub struct Tokens {
-    hashes: Vec<(String, bool)>,
+    hashes: Vec<(String, bool, String)>,
+    module: Module,
+    registry: Arc<Registry>,
 }
 
 impl Tokens {
-    pub fn new(config: &Config, scope: &str) -> Self {
+    pub fn new(config: &Config, scope: &str, module: Module, registry: Arc<Registry>) -> Self {
         Self {
+            module,
+            registry,
             hashes: config
                 .tokens
-                .values()
-                .map(|token| {
+                .iter()
+                .map(|(name, token)| {
                     (
                         token.sha256.clone(),
                         token.scopes.iter().any(|value| value == scope),
+                        name.clone(),
                     )
                 })
                 .collect(),
         }
     }
 
-    fn authorize(&self, secret: &[u8]) -> StatusCode {
+    fn authorize(&self, secret: &[u8]) -> (StatusCode, &str) {
         let presented = format!("{:x}", Sha256::digest(secret));
         let mut known = 0;
         let mut allowed = 0;
-        for (hash, has_scope) in &self.hashes {
+        let mut matched = 0;
+        for (position, (hash, has_scope, _)) in self.hashes.iter().enumerate() {
             let mut difference = usize::from(hash.len() != 64);
             // Black-box each byte so optimization cannot turn this into an early-exit comparison.
             for index in 0..64 {
@@ -45,14 +52,24 @@ impl Tokens {
                 );
             }
             let matches = u8::from(black_box(difference) == 0);
+            let mask = 0usize.wrapping_sub(usize::from(matches));
+            matched = (matched & !mask) | (position & mask);
             known |= matches;
             allowed |= matches & u8::from(*has_scope);
         }
-        match (black_box(known), black_box(allowed)) {
+        let status = match (black_box(known), black_box(allowed)) {
             (0, _) => StatusCode::UNAUTHORIZED,
             (_, 0) => StatusCode::FORBIDDEN,
             _ => StatusCode::OK,
-        }
+        };
+        (
+            status,
+            if known != 0 {
+                &self.hashes[matched].2
+            } else {
+                "unknown"
+            },
+        )
     }
 }
 
@@ -81,23 +98,36 @@ fn credential(headers: &HeaderMap) -> Option<Vec<u8>> {
     Some(secret)
 }
 
+#[derive(Clone)]
+pub struct AuthRefused;
+
 pub async fn require_scope(
     State(tokens): State<Arc<Tokens>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let status = credential(request.headers())
+    let (status, name) = credential(request.headers())
         .map(|secret| tokens.authorize(&secret))
-        .unwrap_or(StatusCode::UNAUTHORIZED);
-    match status {
-        StatusCode::OK => next.run(request).await,
+        .unwrap_or((StatusCode::UNAUTHORIZED, "unknown"));
+    if status != StatusCode::OK {
+        tokens.registry.auth_refusals(tokens.module).add(1);
+        tracing::warn!(
+            event = "auth-refused",
+            module = tokens.module.label(),
+            token = name
+        );
+    }
+    let mut response = match status {
+        StatusCode::OK => return next.run(request).await,
         StatusCode::UNAUTHORIZED => (
             status,
             [(header::WWW_AUTHENTICATE, "Basic realm=\"oroshi\"")],
         )
             .into_response(),
         _ => status.into_response(),
-    }
+    };
+    response.extensions_mut().insert(AuthRefused);
+    response
 }
 
 #[cfg(test)]
@@ -117,23 +147,33 @@ mod tests {
             format!("{:x}", Sha256::digest(b"last")),
         ))
         .unwrap();
-        Tokens::new(&config, scope)
+        Tokens::new(&config, scope, Module::Nix, Arc::new(Registry::new()))
     }
 
     #[test]
     fn compares_all_positions_and_checks_scope() {
         let tokens = tokens("nix:write");
-        assert_eq!(tokens.authorize(b"first"), StatusCode::FORBIDDEN);
-        assert_eq!(tokens.authorize(b"secret"), StatusCode::OK);
-        assert_eq!(tokens.authorize(b"last"), StatusCode::FORBIDDEN);
-        assert_eq!(tokens.authorize(b"unknown"), StatusCode::UNAUTHORIZED);
-        assert_eq!(self::tokens("nix:pin").authorize(b"last"), StatusCode::OK);
+        assert_eq!(tokens.authorize(b"first"), (StatusCode::FORBIDDEN, "first"));
+        assert_eq!(tokens.authorize(b"secret").0, StatusCode::OK);
+        assert_eq!(tokens.authorize(b"last"), (StatusCode::FORBIDDEN, "last"));
         assert_eq!(
-            self::tokens("nix:pin").authorize(b"secret"),
+            tokens.authorize(b"unknown"),
+            (StatusCode::UNAUTHORIZED, "unknown")
+        );
+        assert_eq!(self::tokens("nix:pin").authorize(b"last").0, StatusCode::OK);
+        assert_eq!(
+            self::tokens("nix:pin").authorize(b"secret").0,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            Tokens::new(&Config::default(), "nix:write").authorize(b"secret"),
+            Tokens::new(
+                &Config::default(),
+                "nix:write",
+                Module::Nix,
+                Arc::new(Registry::new())
+            )
+            .authorize(b"secret")
+            .0,
             StatusCode::UNAUTHORIZED
         );
         for index in 0..64 {
@@ -145,7 +185,7 @@ mod tests {
                 "0"
             };
             hash.replace_range(index..index + 1, replacement);
-            assert_eq!(tokens.authorize(b"secret"), StatusCode::UNAUTHORIZED);
+            assert_eq!(tokens.authorize(b"secret").0, StatusCode::UNAUTHORIZED);
         }
     }
 
