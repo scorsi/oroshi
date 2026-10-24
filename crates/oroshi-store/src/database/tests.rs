@@ -24,7 +24,7 @@ fn seed(connection: &Connection) {
 fn empty_database_creates_the_schema_in_the_specified_layout() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("state");
-    let database = Database::open(&root).unwrap();
+    let database = Database::open(&root).unwrap().0;
     assert!(root.join("db/oroshi.sqlite").is_file());
     let writer = database.writer().unwrap();
     assert_eq!(version(&writer), MIGRATIONS.len() as i64);
@@ -48,14 +48,14 @@ fn reopening_preserves_rows_without_reapplying_migrations() {
     let root = tempfile::tempdir().unwrap();
     let schema_version: i64;
     {
-        let database = Database::open(root.path()).unwrap();
+        let database = Database::open(root.path()).unwrap().0;
         let writer = database.writer().unwrap();
         seed(&writer);
         schema_version = writer
             .pragma_query_value(None, "schema_version", |row| row.get(0))
             .unwrap();
     }
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let reader = database.reader().unwrap();
     assert_eq!(version(&reader), MIGRATIONS.len() as i64);
     assert_eq!(
@@ -75,7 +75,7 @@ fn reopening_preserves_rows_without_reapplying_migrations() {
 #[test]
 fn connections_enable_wal_foreign_keys_and_durable_writes() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let writer = database.writer().unwrap();
     let readers = [database.reader().unwrap(), database.reader().unwrap()];
     for connection in [&*writer, &readers[0], &readers[1]] {
@@ -112,7 +112,7 @@ fn connections_enable_wal_foreign_keys_and_durable_writes() {
 #[test]
 fn one_writer_is_serialized_while_readers_keep_independent_snapshots() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let mut writer = database.writer().unwrap();
     assert!(matches!(
         database.writer.try_lock(),
@@ -162,7 +162,7 @@ fn newer_and_negative_schema_versions_are_refused_without_modification() {
 }
 
 #[test]
-fn failing_migration_rolls_back_ddl_data_and_version_but_keeps_prior_migrations() {
+fn failing_migration_rolls_back_all_pending_migrations() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("migration.sqlite");
     let mut connection = Connection::open(&path).unwrap();
@@ -179,17 +179,11 @@ fn failing_migration_rolls_back_ddl_data_and_version_but_keeps_prior_migrations(
     assert!(connection.is_autocommit());
     drop(connection);
     let connection = Connection::open(path).unwrap();
-    assert_eq!(version(&connection), 1);
-    assert_eq!(
-        connection
-            .query_row::<String, _, _>("SELECT value FROM existing", [], |row| row.get(0))
-            .unwrap(),
-        "original"
-    );
+    assert_eq!(version(&connection), 0);
     assert_eq!(
         connection
             .query_row::<i64, _, _>(
-                "SELECT count(*) FROM sqlite_schema WHERE name = 'partial'",
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('existing', 'partial')",
                 [],
                 |row| row.get(0)
             )
@@ -201,7 +195,7 @@ fn failing_migration_rolls_back_ddl_data_and_version_but_keeps_prior_migrations(
 #[test]
 fn schema_enforces_keys_sizes_and_foreign_keys() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let writer = database.writer().unwrap();
     seed(&writer);
     writer
@@ -324,7 +318,7 @@ fn assert_constraint(error: DatabaseError) {
 #[test]
 fn absent_reference_refuses_commit_without_leaving_a_narinfo_or_edges() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let info = hello();
     register_nar(&database, &info);
     assert!(matches!(
@@ -339,7 +333,7 @@ fn absent_reference_refuses_commit_without_leaving_a_narinfo_or_edges() {
 #[test]
 fn self_reference_commits_content_nar_blob_link_and_metadata() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let info = libiconv();
     register_nar(&database, &info);
     database.commit_narinfo(&info, "upload", 2000).unwrap();
@@ -380,7 +374,7 @@ fn self_reference_commits_content_nar_blob_link_and_metadata() {
 #[test]
 fn dependency_order_allows_a_chain_and_survives_restart() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let dependency = libiconv();
     let dependent = hello();
     register_nar(&database, &dependency);
@@ -390,7 +384,7 @@ fn dependency_order_allows_a_chain_and_survives_restart() {
         .unwrap();
     database.commit_narinfo(&dependent, "upload", 2001).unwrap();
     drop(database);
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     assert_eq!(
         stored_paths(&database),
         [dependent.store_path.clone(), dependency.store_path.clone()]
@@ -407,7 +401,7 @@ fn dependency_order_allows_a_chain_and_survives_restart() {
 #[test]
 fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let dependency = libiconv();
     let mut dependent = hello();
     dependent.references.insert(dependent.store_path.clone());
@@ -453,7 +447,7 @@ fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
 #[test]
 fn absent_nar_refuses_commit_without_rows() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     assert_constraint(
         database
             .commit_narinfo(&libiconv(), "upload", 2000)
@@ -466,7 +460,7 @@ fn absent_nar_refuses_commit_without_rows() {
 #[test]
 fn duplicate_path_never_overwrites_existing_metadata() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let info = libiconv();
     register_nar(&database, &info);
     database.commit_narinfo(&info, "upload", 2000).unwrap();
@@ -491,7 +485,7 @@ fn duplicate_path_never_overwrites_existing_metadata() {
 #[test]
 fn invalid_store_path_returns_an_error_without_writing() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let mut info = libiconv();
     info.store_path = "/nix/store/invalid".into();
     assert!(matches!(
@@ -516,7 +510,7 @@ fn last_access(database: &Database, store_hash: &str) -> i64 {
 #[test]
 fn reads_record_access_and_share_an_hourly_limit_between_narinfo_and_nar() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     seed(&database.writer().unwrap());
     let hash = "00000000000000000000000000000000";
     let url = "nar/example.nar.zst";
@@ -542,14 +536,14 @@ fn reads_record_access_and_share_an_hourly_limit_between_narinfo_and_nar() {
 #[test]
 fn access_batching_survives_restart_and_ignores_backwards_time_and_missing_entries() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     seed(&database.writer().unwrap());
     let hash = "00000000000000000000000000000000";
     let url = "nar/example.nar.zst";
     assert_eq!(database.record_narinfo_access(hash, 5000).unwrap(), 1);
     drop(database);
 
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     for now in [i64::MIN, 4999, 5000, 8599] {
         assert_eq!(database.record_narinfo_access(hash, now).unwrap(), 0);
         assert_eq!(database.record_nar_access(url, now).unwrap(), 0);
@@ -565,7 +559,7 @@ fn access_batching_survives_restart_and_ignores_backwards_time_and_missing_entri
 #[test]
 fn accesses_to_different_entries_are_independent() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let dependency = libiconv();
     let dependent = hello();
     for info in [&dependency, &dependent] {
@@ -594,7 +588,7 @@ fn accesses_to_different_entries_are_independent() {
 #[test]
 fn nar_reads_update_each_linked_entry_only_when_due() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     seed(&database.writer().unwrap());
     database
         .writer()
@@ -629,7 +623,7 @@ fn nar_reads_update_each_linked_entry_only_when_due() {
 #[test]
 fn read_lookups_resolve_registered_content_and_blob_and_return_none_on_miss() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     seed(&database.writer().unwrap());
     assert_eq!(
         database
@@ -657,7 +651,7 @@ fn read_lookups_resolve_registered_content_and_blob_and_return_none_on_miss() {
 #[test]
 fn concurrent_signature_merges_preserve_both_signatures_and_original_metadata() {
     let root = tempfile::tempdir().unwrap();
-    let database = Database::open(root.path()).unwrap();
+    let database = Database::open(root.path()).unwrap().0;
     let info = libiconv();
     register_nar(&database, &info);
     let mut initial = info.clone();
@@ -695,4 +689,13 @@ fn concurrent_signature_merges_preserve_both_signatures_and_original_metadata() 
         edges(&database),
         [(initial.store_path.clone(), initial.store_path)]
     );
+}
+
+#[test]
+fn open_reports_only_committed_migration_versions() {
+    let root = tempfile::tempdir().unwrap();
+    let (database, applied) = Database::open(root.path()).unwrap();
+    assert_eq!(applied, (1..=MIGRATIONS.len()).collect::<Vec<_>>());
+    drop(database);
+    assert!(Database::open(root.path()).unwrap().1.is_empty());
 }

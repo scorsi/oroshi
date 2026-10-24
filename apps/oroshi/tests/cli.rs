@@ -38,7 +38,7 @@ fn invalid_arguments_fail_with_usage() {
             .output()
             .unwrap();
 
-        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         let v = log_line(&output.stderr);
         assert_eq!(v["event"], "fatal");
@@ -141,10 +141,15 @@ fn config_check_stays_quiet_but_reports_errors_with_logging_off() {
 #[test]
 fn serve_emits_start_before_reporting_bind_failure() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let path = std::env::temp_dir().join(format!("oroshi-serve-{}.toml", std::process::id()));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
     std::fs::write(
         &path,
-        format!("[server]\nlisten = '{}'\n", occupied.local_addr().unwrap()),
+        format!(
+            "[server]\nlisten = '{}'\n[storage]\ndir = {:?}\n",
+            occupied.local_addr().unwrap(),
+            directory.path().join("state")
+        ),
     )
     .unwrap();
     for filter in ["info", "off"] {
@@ -204,9 +209,14 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let config = directory.0.join("config.toml");
+    let metrics_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     std::fs::write(
         &config,
-        format!("[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:0'\n[storage]\ndir = '{}'\n", directory.0.join("state").display()),
+        format!("[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:{metrics_port}'\n[storage]\ndir = '{}'\n", directory.0.join("state").display()),
     )
     .unwrap();
     for signal in ["-TERM", "-INT"] {
@@ -254,8 +264,19 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
             .split_inclusive(|&b| b == b'\n')
             .map(log_line)
             .collect();
+        let migrations: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "migration-applied")
+            .collect();
+        if signal == "-TERM" {
+            assert_eq!(migrations.len(), 1);
+            assert_eq!(migrations[0]["version"], 1);
+        } else {
+            assert!(migrations.is_empty());
+        }
         let events: Vec<_> = lines
             .iter()
+            .filter(|line| line["event"] != "migration-applied")
             .map(|line| line["event"].as_str().unwrap())
             .collect();
         assert_eq!(
@@ -400,4 +421,54 @@ fn store_open_failure_exits_without_ready_notification() {
         let error = receiver.recv(&mut [0; 64]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
+}
+
+#[test]
+fn help_prints_usage_on_stdout_and_exits_zero() {
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert!(
+        std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .starts_with("usage: oroshi ")
+    );
+}
+
+#[test]
+fn second_serve_exits_fatal_without_removing_in_flight_uploads() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(state.join("tmp")).unwrap();
+    let lock = std::fs::File::create(state.join("oroshi.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let upload = state.join("tmp/in-flight");
+    std::fs::write(&upload, b"partial").unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[server]\nlisten = '127.0.0.1:0'\n[storage]\ndir = {state:?}"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        .env("RUST_LOG", "off")
+        .env_remove("NOTIFY_SOCKET")
+        .args(["serve", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let line = log_line(&output.stderr);
+    assert_eq!(line["event"], "fatal");
+    assert!(
+        line["err"]
+            .as_str()
+            .unwrap()
+            .contains("state directory lock")
+    );
+    assert_eq!(std::fs::read(upload).unwrap(), b"partial");
+    assert!(!state.join("LAYOUT").exists());
 }

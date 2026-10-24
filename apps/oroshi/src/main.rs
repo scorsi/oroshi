@@ -11,9 +11,12 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+const USAGE: &str = "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path>";
+
 #[derive(Debug, PartialEq)]
 enum Command {
     Version,
+    Help,
     TokenHash,
     ConfigCheck(PathBuf),
     Serve(PathBuf),
@@ -21,6 +24,7 @@ enum Command {
 
 fn command(args: &[OsString]) -> Result<Command, &'static str> {
     match args {
+        [help] if help == "--help" => Ok(Command::Help),
         [version] if version == OsStr::new("--version") => Ok(Command::Version),
         [token, hash] if token == "token" && hash == "hash" => Ok(Command::TokenHash),
         [serve, flag, path] if serve == "serve" && flag == "--config" => {
@@ -34,16 +38,21 @@ fn command(args: &[OsString]) -> Result<Command, &'static str> {
         {
             Ok(Command::ConfigCheck(path.into()))
         }
-        _ => Err(
-            "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path>",
-        ),
+        _ => Err(USAGE),
     }
 }
 
 async fn run(args: &[OsString]) -> Result<ExitCode, String> {
-    let cmd = command(args)?;
+    let cmd = match command(args) {
+        Ok(cmd) => cmd,
+        Err(usage) => {
+            log::error("fatal", usage);
+            return Ok(ExitCode::from(2));
+        }
+    };
     let serve = matches!(cmd, Command::Serve(_));
     match cmd {
+        Command::Help => println!("{USAGE}"),
         Command::Version => println!("oroshi {}", env!("CARGO_PKG_VERSION")),
         Command::TokenHash => {
             use sha2::{Digest, Sha256};
@@ -79,6 +88,8 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
             if serve {
                 log::init(&config.log.level)?;
                 tracing::info!(event = "start", version = env!("CARGO_PKG_VERSION"));
+                let _state_lock =
+                    server::lock_state(&config.storage.dir).map_err(|error| error.to_string())?;
                 server::Server::bind(&config)
                     .await
                     .map_err(|error| error.to_string())?

@@ -160,9 +160,21 @@ impl Config {
                 .map_err(|_| format!("nix.trusted_keys[{index}] must be a valid public key"))?;
         }
         if let Some(listen) = self.metrics.listen
-            && !listen.ip().is_loopback()
+            && (!listen.ip().is_loopback() || listen.port() == 0)
         {
-            return Err("metrics.listen must be a loopback address".into());
+            return Err("metrics.listen must be a loopback address with a non-zero port".into());
+        }
+        if self.gc.orphan_grace < 2 {
+            return Err("gc.orphan_grace must be at least 2 seconds".into());
+        }
+        if !self.storage.gc_target_ratio.is_finite()
+            || self.storage.gc_target_ratio <= 0.0
+            || self.storage.gc_target_ratio > 1.0
+        {
+            return Err("storage.gc_target_ratio must be finite and in (0, 1]".into());
+        }
+        if self.retention.days == 0 {
+            return Err("retention.days must be greater than 0".into());
         }
         for (name, token) in &self.tokens {
             if token.sha256.len() != 64
@@ -405,5 +417,32 @@ max_nar_bytes = 1024
             ["builder.example.org:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]
         );
         assert_eq!(config.nix.max_nar_bytes, 17179869184);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    #[test]
+    fn refuses_out_of_range_config_with_field_names() {
+        for (table, field, values) in [
+            ("gc", "orphan_grace", vec!["0", "1"]),
+            (
+                "storage",
+                "gc_target_ratio",
+                vec!["nan", "inf", "-inf", "0.0", "-0.1", "1.01"],
+            ),
+            ("retention", "days", vec!["0"]),
+            ("metrics", "listen", vec!["'127.0.0.1:0'", "'[::1]:0'"]),
+        ] {
+            for value in values {
+                let err = Config::parse(&format!("[{table}]\n{field} = {value}")).unwrap_err();
+                assert!(err.contains(&format!("{table}.{field}")), "{err}");
+            }
+        }
+        Config::parse(
+            "[gc]\norphan_grace = 2\n[storage]\ngc_target_ratio = 1.0\n[retention]\ndays = 1",
+        )
+        .unwrap();
     }
 }

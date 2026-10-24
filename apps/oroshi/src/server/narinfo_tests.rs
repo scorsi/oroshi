@@ -64,6 +64,12 @@ async fn read(app: Router, info: &NarInfo) -> NarInfo {
 
 async fn refused(response: Response, status: StatusCode, reason: &str) {
     assert_eq!(response.status(), status);
+    assert!(
+        response
+            .extensions()
+            .get::<crate::nix::UploadRefused>()
+            .is_some()
+    );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert!(
         std::str::from_utf8(&body).unwrap().contains(reason),
@@ -81,7 +87,7 @@ async fn signed_closure_commits_self_reference_and_is_readable_after_reopen() {
     assert_eq!(read(app.clone(), &libiconv).await, libiconv);
     assert_eq!(read(app.clone(), &hello).await, hello);
     assert_eq!(row_count(&store, "reference"), 2);
-    let reopened = oroshi_store::Database::open(root.path()).unwrap();
+    let reopened = oroshi_store::Database::open(root.path()).unwrap().0;
     assert_eq!(
         reopened
             .narinfo(parse_store_path(&hello.store_path).unwrap().hash)
@@ -144,7 +150,7 @@ async fn bad_store_hash_and_url_hash_mismatch_are_refused() {
         )
         .await,
         StatusCode::BAD_REQUEST,
-        "store",
+        "invalid-narinfo",
     )
     .await;
     assert_eq!(row_count(&store, "narinfo"), 0);
@@ -157,7 +163,7 @@ async fn malformed_nar_urls_and_missing_nars_are_refused() {
     refused(
         put(app.clone(), &info).await,
         StatusCode::BAD_REQUEST,
-        "not uploaded",
+        "missing-nar",
     )
     .await;
     for url in [
@@ -171,7 +177,7 @@ async fn malformed_nar_urls_and_missing_nars_are_refused() {
         refused(
             put(app.clone(), &info).await,
             StatusCode::BAD_REQUEST,
-            "NAR URL",
+            "bad-name",
         )
         .await;
     }
@@ -193,7 +199,11 @@ async fn file_hash_and_size_must_be_present_and_match_uploaded_nar() {
         refused(
             put(app.clone(), &info).await,
             StatusCode::BAD_REQUEST,
-            "FileHash or FileSize",
+            if change < 2 {
+                "hash-mismatch"
+            } else {
+                "file-size-mismatch"
+            },
         )
         .await;
     }
@@ -221,7 +231,7 @@ async fn missing_nar_hash_and_size_and_malformed_body_are_refused() {
             )
             .await,
             StatusCode::BAD_REQUEST,
-            field,
+            "invalid-narinfo",
         )
         .await;
     }
@@ -274,10 +284,16 @@ async fn unsigned_untrusted_and_invalid_signatures_are_refused() {
             2 => info.nar_size += 1,
             _ => info.signatures.push("malformed".into()),
         }
-        assert_eq!(
-            put(app.clone(), &info).await.status(),
-            StatusCode::BAD_REQUEST
-        );
+        refused(
+            put(app.clone(), &info).await,
+            StatusCode::BAD_REQUEST,
+            if change == 0 {
+                "unsigned"
+            } else {
+                "untrusted-key"
+            },
+        )
+        .await;
     }
     assert_eq!(row_count(&store, "narinfo"), 0);
 }
@@ -304,7 +320,7 @@ async fn non_signature_conflicts_return_409_without_changing_content() {
         refused(
             put(app.clone(), &info).await,
             StatusCode::CONFLICT,
-            "conflicting",
+            "conflict",
         )
         .await;
         assert_eq!(read(app.clone(), &original).await, original);
@@ -422,10 +438,12 @@ async fn unsupported_content_encoding_returns_415_and_identity_is_accepted() {
                 .header(header::CONTENT_ENCODING, encoding)
                 .body(Body::from(info.to_string()))
                 .unwrap();
-            assert_eq!(
-                send(app.clone(), request).await.status(),
-                StatusCode::UNSUPPORTED_MEDIA_TYPE
-            );
+            refused(
+                send(app.clone(), request).await,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported-encoding",
+            )
+            .await;
         }
     }
     assert_eq!(row_count(&store, "narinfo"), 0);
@@ -487,7 +505,60 @@ async fn configured_upstream_key_accepts_upstream_only_and_empty_trust_refuses_i
     refused(
         put(router, &info).await,
         StatusCode::BAD_REQUEST,
-        "trusted key",
+        "untrusted-key",
     )
     .await;
+}
+
+#[tokio::test]
+async fn narinfo_body_cap_accepts_64_kib_and_refuses_one_more_without_reading_the_tail() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio_util::io::ReaderStream;
+    struct CappedBody(usize);
+    impl AsyncRead for CappedBody {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            assert!(self.0 > 0, "read beyond 64 KiB + 1");
+            let len = buf.remaining().min(self.0);
+            buf.put_slice(&vec![b'x'; len]);
+            self.0 -= len;
+            Poll::Ready(Ok(()))
+        }
+    }
+    let (_root, store, app) = fixture();
+    let info = uploaded(app.clone(), LIBICONV).await;
+    // CA is an opaque unsigned transport field; pad it to the exact body boundary.
+    let mut wire = info.to_string();
+    let padding = 64 * 1024 - wire.len() - "CA: \n".len();
+    wire.push_str(&format!("CA: {}\n", "x".repeat(padding)));
+    assert_eq!(wire.len(), 64 * 1024);
+    assert_eq!(
+        request(
+            app.clone(),
+            "PUT",
+            &path(&info),
+            Some("secret"),
+            Body::from(wire)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    for body in [
+        Body::from(vec![b'x'; 64 * 1024 + 1]),
+        Body::from_stream(ReaderStream::new(CappedBody(64 * 1024 + 1))),
+    ] {
+        refused(
+            request(app.clone(), "PUT", &path(&info), Some("secret"), body).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too-large",
+        )
+        .await;
+    }
+    assert_eq!(row_count(&store, "narinfo"), 1);
 }

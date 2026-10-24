@@ -19,7 +19,7 @@ fn fixture_with_limits(
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::nix::Store {
         blobs: oroshi_store::BlobStore::open(root.path()).unwrap(),
-        database: oroshi_store::Database::open(root.path()).unwrap(),
+        database: oroshi_store::Database::open(root.path()).unwrap().0,
         limits,
         upload_gate: Arc::default(),
         priority: 30,
@@ -441,7 +441,8 @@ fn paced_body(interval: std::time::Duration, size: usize) -> Body {
 
 #[tokio::test]
 async fn continuous_upload_hits_total_deadline_and_cleans_partial_file() {
-    let mut limits = limits("[gc]\norphan_grace = 1");
+    let mut limits = limits("");
+    limits.deadline = std::time::Duration::from_millis(499);
     assert!(limits.deadline < std::time::Duration::from_millis(500));
     limits.idle_timeout = std::time::Duration::from_secs(1);
     let (root, store, app) = fixture_with_limits(limits);
@@ -459,6 +460,10 @@ async fn continuous_upload_hits_total_deadline_and_cleans_partial_file() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        "deadline"
+    );
     assert_empty(root.path(), &store, &bytes);
 }
 
@@ -483,6 +488,10 @@ async fn idle_upload_times_out_and_cleans_partial_file() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        "idle"
+    );
     assert!(start.elapsed() < std::time::Duration::from_millis(500));
     assert_empty(root.path(), &store, b"xx");
 }
@@ -577,6 +586,10 @@ async fn narinfo_uploads_also_enforce_idle_timeout() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        "idle"
+    );
     assert!(start.elapsed() < std::time::Duration::from_millis(500));
     assert_empty(root.path(), &store, b"xx");
 }
@@ -636,4 +649,45 @@ async fn upload_without_any_received_bytes_hits_idle_timeout() {
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     assert!(start.elapsed() < std::time::Duration::from_millis(500));
     assert_empty(root.path(), &store, b"data");
+}
+
+#[tokio::test]
+async fn nar_refusal_reasons_are_plain_text_and_logged_verbatim() {
+    for (config, bytes, expected, status) in [
+        ("", "bad", "hash-mismatch", StatusCode::BAD_REQUEST),
+        (
+            "[nix]\nmax_nar_bytes = 2",
+            "data",
+            "too-large",
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "[storage]\nmax_bytes = 2",
+            "data",
+            "storage-full",
+            StatusCode::INSUFFICIENT_STORAGE,
+        ),
+    ] {
+        let (_root, store, _) = fixture_with_limits(limits(config));
+        let registry = Arc::new(Registry::new());
+        let app = app(store, registry, &super::observability_tests::config());
+        let (response, lines, _) = super::observability_tests::logged_request(
+            app,
+            &path(b"data", ".nar"),
+            Some("secret"),
+            Body::from(bytes),
+        )
+        .await;
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            expected
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["reason"], expected);
+    }
 }

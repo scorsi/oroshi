@@ -98,7 +98,36 @@ struct UploadCommitted {
 }
 
 #[derive(Clone)]
-pub struct UploadRefused;
+pub struct UploadRefused(&'static str);
+
+struct UploadError(StatusCode, &'static str);
+
+impl IntoResponse for UploadError {
+    fn into_response(self) -> Response {
+        (self.0, Extension(UploadRefused(self.1)), self.1).into_response()
+    }
+}
+
+impl From<StatusCode> for UploadError {
+    fn from(status: StatusCode) -> Self {
+        Self(status, "storage-error")
+    }
+}
+
+fn read_failure(error: &io::Error) -> UploadError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        UploadError(
+            StatusCode::REQUEST_TIMEOUT,
+            if error.to_string() == "idle" {
+                "idle"
+            } else {
+                "deadline"
+            },
+        )
+    } else {
+        UploadError(StatusCode::BAD_REQUEST, "invalid-body")
+    }
+}
 
 async fn observe_upload(
     State(registry): State<Arc<Registry>>,
@@ -130,10 +159,14 @@ async fn observe_upload(
         );
     } else if !response.status().is_success() {
         registry.uploads(Module::Nix, UploadResult::Refused).add(1);
-        // Status text cannot echo credentials or untrusted request body fields.
-        tracing::warn!(event = "upload-refused", module = "nix", kind,
-            reason = %response.status());
-        response.extensions_mut().insert(UploadRefused);
+        let reason = response
+            .extensions()
+            .get::<UploadRefused>()
+            .map_or("bad-name", |refusal| refusal.0);
+        if response.extensions().get::<UploadRefused>().is_none() {
+            response = UploadError(response.status(), reason).into_response();
+        }
+        tracing::warn!(event = "upload-refused", module = "nix", kind, reason);
     }
     response
 }
@@ -157,7 +190,8 @@ async fn check_encoding(request: Request, next: Next) -> Response {
             .iter()
             .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
     {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+        return UploadError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported-encoding")
+            .into_response();
     }
     next.run(request).await
 }
@@ -166,94 +200,79 @@ async fn put_narinfo(
     State(store): State<Arc<Store>>,
     Path(name): Path<String>,
     body: Body,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, UploadError> {
     let hash = name
         .strip_suffix(".narinfo")
-        .ok_or((StatusCode::FORBIDDEN, "unsupported PUT path".into()))?;
-    let mut reader = UploadReader::new(body, &store.limits);
+        .ok_or(UploadError(StatusCode::FORBIDDEN, "bad-name"))?
+        .to_owned();
+    let reader = UploadReader::new(body, &store.limits);
     let bytes = tokio::task::spawn_blocking(move || {
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).map_err(|error| {
-            (
-                if error.kind() == io::ErrorKind::TimedOut {
-                    StatusCode::REQUEST_TIMEOUT
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                "failed to read narinfo body".to_owned(),
-            )
-        })?;
+        reader
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| read_failure(&error))?;
+        if bytes.len() > 64 * 1024 {
+            return Err(UploadError(StatusCode::PAYLOAD_TOO_LARGE, "too-large"));
+        }
         Ok(bytes)
     })
     .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upload worker failed".into(),
-        )
-    })??;
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
     let size = bytes.len() as u64;
-    let body = std::str::from_utf8(&bytes)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "narinfo is not UTF-8".into()))?;
+    let invalid = |_| UploadError(StatusCode::BAD_REQUEST, "invalid-narinfo");
+    let body = std::str::from_utf8(&bytes).map_err(invalid)?;
     let info: NarInfo = body
         .parse()
-        .map_err(|error: oroshi_nix::ParseError| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(|_| UploadError(StatusCode::BAD_REQUEST, "invalid-narinfo"))?;
     if parse_store_path(&info.store_path)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?
+        .map_err(|_| UploadError(StatusCode::BAD_REQUEST, "bad-name"))?
         .hash
         != hash
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "StorePath hash does not match URL hash".into(),
-        ));
+        return Err(UploadError(StatusCode::BAD_REQUEST, "hash-mismatch"));
     }
-    let hash = hash.to_owned();
     tokio::task::spawn_blocking(move || {
-        let failure = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_owned());
-        let internal = |_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage failure".to_owned(),
-            )
-        };
+        let failure = |reason| UploadError(StatusCode::BAD_REQUEST, reason);
+        let internal = |_| UploadError(StatusCode::INTERNAL_SERVER_ERROR, "storage-error");
         // Conflicting re-uploads are 409 even when their changed fields fail ingest checks.
         if let Some(content) = store.database.narinfo(&hash).map_err(internal)? {
-            let mut existing: NarInfo = content.parse().map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "invalid stored narinfo".to_owned(),
-                )
-            })?;
+            let mut existing: NarInfo = content
+                .parse()
+                .map_err(|_| UploadError(StatusCode::INTERNAL_SERVER_ERROR, "storage-error"))?;
             existing
                 .merge_signatures(&info)
-                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                .map_err(|_| UploadError(StatusCode::CONFLICT, "conflict"))?;
         }
-        info.verify_signatures(&store.trusted_keys)
-            .map_err(|error| failure(&error.to_string()))?;
+        info.verify_signatures(&store.trusted_keys).map_err(|_| {
+            failure(if info.signatures.is_empty() {
+                "unsigned"
+            } else {
+                "untrusted-key"
+            })
+        })?;
         let file = info
             .url
             .strip_prefix("nar/")
-            .ok_or_else(|| failure("invalid NAR URL"))?;
-        file_hash(file).ok_or_else(|| failure("invalid NAR URL"))?;
+            .ok_or_else(|| failure("bad-name"))?;
+        file_hash(file).ok_or_else(|| failure("bad-name"))?;
         let blob = store
             .database
             .nar_blob(&info.url)
             .map_err(internal)?
-            .ok_or_else(|| failure("NAR is not uploaded"))?;
-        if info.file_hash != Some(blob.hash) || info.file_size != Some(blob.size) {
-            return Err(failure("FileHash or FileSize does not match uploaded NAR"));
+            .ok_or_else(|| failure("missing-nar"))?;
+        if info.file_hash != Some(blob.hash) {
+            return Err(failure("hash-mismatch"));
+        }
+        if info.file_size != Some(blob.size) {
+            return Err(failure("file-size-mismatch"));
         }
         store
             .database
-            .commit_narinfo(
-                &info,
-                "upload",
-                now().map_err(|code| (code, "clock failure".into()))?,
-            )
+            .commit_narinfo(&info, "upload", now()?)
             .map_err(|error| match error {
-                DatabaseError::NarinfoConflict => (StatusCode::CONFLICT, error.to_string()),
-                DatabaseError::MissingReference => failure("missing narinfo reference"),
+                DatabaseError::NarinfoConflict => UploadError(StatusCode::CONFLICT, "conflict"),
+                DatabaseError::MissingReference => failure("missing-reference"),
                 _ => internal(error),
             })?;
         Ok((
@@ -266,12 +285,7 @@ async fn put_narinfo(
             .into_response())
     })
     .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upload worker failed".into(),
-        )
-    })?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 async fn cache_info(State(store): State<Arc<Store>>) -> String {
@@ -392,11 +406,18 @@ impl Read for UploadReader {
             return Ok(0);
         }
         if Instant::now() >= self.deadline {
-            return Err(io::ErrorKind::TimedOut.into());
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
         }
         while self.chunk.is_empty() {
             if Instant::now() >= self.deadline.min(self.idle_deadline) {
-                return Err(io::ErrorKind::TimedOut.into());
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    if self.deadline <= self.idle_deadline {
+                        "deadline"
+                    } else {
+                        "idle"
+                    },
+                ));
             }
             let frame = self
                 .runtime
@@ -404,7 +425,16 @@ impl Read for UploadReader {
                     self.deadline.min(self.idle_deadline),
                     std::future::poll_fn(|cx| Pin::new(&mut self.body).poll_frame(cx)),
                 ))
-                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        if self.deadline <= self.idle_deadline {
+                            "deadline"
+                        } else {
+                            "idle"
+                        },
+                    )
+                })?;
             let Some(frame) = frame else { return Ok(0) };
             let frame =
                 frame.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -425,8 +455,8 @@ async fn put_nar(
     State(store): State<Arc<Store>>,
     Path(file): Path<String>,
     body: Body,
-) -> Result<Response, StatusCode> {
-    let hash = file_hash(&file).ok_or(StatusCode::FORBIDDEN)?;
+) -> Result<Response, UploadError> {
+    let hash = file_hash(&file).ok_or(UploadError(StatusCode::FORBIDDEN, "bad-name"))?;
     let reader = UploadReader::new(body, &store.limits);
     // shortcut: serialize capped uploads through registration; reserve bytes if parallel uploads are needed.
     let gate = if store.limits.max_bytes.is_some() {
@@ -436,7 +466,16 @@ async fn put_nar(
                 store.upload_gate.clone().lock_owned(),
             )
             .await
-            .map_err(|_| StatusCode::REQUEST_TIMEOUT)?,
+            .map_err(|_| {
+                UploadError(
+                    StatusCode::REQUEST_TIMEOUT,
+                    if reader.deadline <= reader.idle_deadline {
+                        "deadline"
+                    } else {
+                        "idle"
+                    },
+                )
+            })?,
         )
     } else {
         None
@@ -454,7 +493,10 @@ async fn put_nar(
                     .blob_size(&hash)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 if used >= cap && existing.is_none() {
-                    return Err(StatusCode::INSUFFICIENT_STORAGE);
+                    return Err(UploadError(
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        "storage-full",
+                    ));
                 }
                 // Re-uploading an immutable hash consumes no additional stored bytes.
                 cap.saturating_sub(used)
@@ -468,12 +510,15 @@ async fn put_nar(
             .write(reader, cap, Some(&hash))
             .map_err(|error| match error.kind() {
                 io::ErrorKind::FileTooLarge if remaining < store.limits.max_nar_bytes => {
-                    StatusCode::INSUFFICIENT_STORAGE
+                    UploadError(StatusCode::INSUFFICIENT_STORAGE, "storage-full")
                 }
-                io::ErrorKind::FileTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-                io::ErrorKind::TimedOut => StatusCode::REQUEST_TIMEOUT,
-                io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
+                io::ErrorKind::FileTooLarge => {
+                    UploadError(StatusCode::PAYLOAD_TOO_LARGE, "too-large")
+                }
+                io::ErrorKind::TimedOut => read_failure(&error),
+                io::ErrorKind::InvalidData => UploadError(StatusCode::BAD_REQUEST, "hash-mismatch"),
+                io::ErrorKind::InvalidInput => UploadError(StatusCode::BAD_REQUEST, "invalid-body"),
+                _ => UploadError(StatusCode::INTERNAL_SERVER_ERROR, "storage-error"),
             })?;
         store
             .database
@@ -489,7 +534,7 @@ async fn put_nar(
             .into_response())
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| UploadError(StatusCode::INTERNAL_SERVER_ERROR, "storage-error"))?
 }
 
 #[cfg(test)]

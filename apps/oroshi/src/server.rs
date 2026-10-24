@@ -49,18 +49,25 @@ impl Server {
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?;
         let limits = crate::nix::UploadLimits::new(config);
-        let store = tokio::task::spawn_blocking(move || {
-            Ok::<_, io::Error>(Arc::new(crate::nix::Store {
-                blobs: oroshi_store::BlobStore::open(&root)?,
-                database: oroshi_store::Database::open(&root).map_err(io::Error::other)?,
-                priority,
-                trusted_keys,
-                limits,
-                upload_gate: Arc::default(),
-            }))
+        let (store, applied) = tokio::task::spawn_blocking(move || {
+            let blobs = oroshi_store::BlobStore::open(&root)?;
+            let (database, applied) =
+                oroshi_store::Database::open(&root).map_err(io::Error::other)?;
+            Ok::<_, io::Error>((
+                Arc::new(crate::nix::Store {
+                    blobs,
+                    database,
+                    priority,
+                    trusted_keys,
+                    limits,
+                    upload_gate: Arc::default(),
+                }),
+                applied,
+            ))
         })
         .await
         .map_err(io::Error::other)??;
+        log_migrations(&applied);
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
         let shutdown = async move {
@@ -119,6 +126,36 @@ impl Server {
                 notified
             }
         }
+    }
+}
+
+pub(crate) fn lock_state(root: &std::path::Path) -> io::Result<std::fs::File> {
+    let missing: Vec<_> = root
+        .ancestors()
+        .take_while(|path| !path.exists())
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    std::fs::create_dir_all(root)?;
+    for path in missing.iter().rev() {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("oroshi.lock"))?;
+    lock.try_lock()
+        .map_err(|error| io::Error::other(format!("state directory lock: {error}")))?;
+    Ok(lock)
+}
+
+fn log_migrations(applied: &[usize]) {
+    for &version in applied {
+        tracing::info!(event = "migration-applied", version);
     }
 }
 
@@ -233,27 +270,31 @@ async fn count_request(
 async fn exposition(
     State((registry, store)): State<(Arc<Registry>, Arc<crate::nix::Store>)>,
 ) -> Result<([(header::HeaderName, &'static str); 1], String), StatusCode> {
-    tokio::task::spawn_blocking(move || {
-        let (bytes, blobs) = store
-            .database
-            .reader()
-            .and_then(|reader| {
-                Ok(reader.query_row(
-                    "SELECT coalesce(sum(size), 0), count(*) FROM blob",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )?)
-            })
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        registry.stored_bytes.set(bytes);
-        registry.blobs.set(blobs);
-        Ok((
-            [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
-            registry.exposition(),
-        ))
+    let start = Instant::now();
+    let (bytes, blobs) = tokio::task::spawn_blocking(move || {
+        store.database.reader().and_then(|reader| {
+            Ok(reader.query_row(
+                "SELECT coalesce(sum(size), 0), count(*) FROM blob",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?)
+        })
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|error| metrics_failure(&error, start))?
+    .map_err(|error| metrics_failure(&error, start))?;
+    registry.stored_bytes.set(bytes);
+    registry.blobs.set(blobs);
+    Ok((
+        [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        registry.exposition(),
+    ))
+}
+
+fn metrics_failure(error: &dyn std::fmt::Display, start: Instant) -> StatusCode {
+    tracing::error!(event = "request", module = "other", method = "GET", path = "/metrics",
+        status = 500_u16, bytes = 0_u64, dur_us = start.elapsed().as_micros() as u64, err = %error);
+    StatusCode::INTERNAL_SERVER_ERROR
 }
 
 #[cfg(test)]
@@ -292,12 +333,16 @@ mod tests {
     }
 
     fn config(metrics: bool) -> Config {
-        Config::parse(if metrics {
-            "[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:0'"
+        let mut config = Config::parse(if metrics {
+            "[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:9000'"
         } else {
             "[server]\nlisten = '127.0.0.1:0'"
         })
-        .unwrap()
+        .unwrap();
+        if metrics {
+            config.metrics.listen.as_mut().unwrap().set_port(0);
+        }
+        config
     }
 
     #[test]
@@ -486,3 +531,20 @@ mod narinfo_tests;
 
 #[cfg(test)]
 mod observability_tests;
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn state_lock_refuses_second_owner_without_cleaning_uploads_and_releases_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = lock_state(root.path()).unwrap();
+        let _blobs = oroshi_store::BlobStore::open(root.path()).unwrap();
+        let upload = root.path().join("tmp/in-flight");
+        std::fs::write(&upload, b"partial").unwrap();
+        assert!(lock_state(root.path()).is_err());
+        assert_eq!(std::fs::read(&upload).unwrap(), b"partial");
+        drop(lock);
+        assert!(lock_state(root.path()).is_ok());
+    }
+}

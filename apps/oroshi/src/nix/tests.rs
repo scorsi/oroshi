@@ -12,7 +12,7 @@ pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Store>, Vec<u8>, NarInfo) {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(Store {
         blobs: BlobStore::open(root.path()).unwrap(),
-        database: Database::open(root.path()).unwrap(),
+        database: Database::open(root.path()).unwrap().0,
         limits: UploadLimits::new(&crate::config::Config::default()),
         upload_gate: Arc::default(),
         priority: 17,

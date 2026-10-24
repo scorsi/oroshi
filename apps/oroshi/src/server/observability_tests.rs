@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
-fn config() -> Config {
+pub(super) fn config() -> Config {
     Config::parse(&format!(
         "[log]\naccess = true\n[tokens.writer]\nsha256 = {:?}\nscopes = ['nix:write']\n\
          [tokens.reader]\nsha256 = {:?}\nscopes = ['nix:read']\n",
@@ -19,7 +19,7 @@ fn config() -> Config {
     .unwrap()
 }
 
-async fn logged_request(
+pub(super) async fn logged_request(
     app: Router,
     path: &str,
     credential: Option<&str>,
@@ -78,7 +78,22 @@ async fn each_upload_refusal_has_one_schema_line_and_one_counter() {
         assert_eq!(line["level"], "warn");
         assert_eq!(line["module"], "nix");
         assert_eq!(line["kind"], kind);
-        assert_eq!(line["reason"], response.status().to_string());
+        let reason = if kind == "narinfo" {
+            "invalid-narinfo"
+        } else {
+            "bad-name"
+        };
+        assert_eq!(line["reason"], reason);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            reason
+        );
         assert!(!text.contains("secret"), "{text}");
         assert_eq!(
             registry.uploads(Module::Nix, UploadResult::Refused).get(),
@@ -197,7 +212,7 @@ async fn commits_count_actual_bytes_and_scrapes_refresh_deduplicated_database_ga
     // A fresh registry and reopened database must expose persisted totals, not process deltas.
     let reopened = Arc::new(crate::nix::Store {
         blobs: oroshi_store::BlobStore::open(root.path()).unwrap(),
-        database: oroshi_store::Database::open(root.path()).unwrap(),
+        database: oroshi_store::Database::open(root.path()).unwrap().0,
         priority: 30,
         trusted_keys: Vec::new(),
         limits: crate::nix::UploadLimits::new(&Config::default()),
@@ -272,4 +287,76 @@ async fn narinfo_commits_log_store_names_and_count_wire_bytes() {
             info.file_size.unwrap() + count * wire.len() as u64
         );
     }
+}
+
+#[tokio::test]
+async fn failed_metrics_read_logs_one_error_request_with_integer_status() {
+    let (_root, store, _) = fixture();
+    store
+        .database
+        .writer()
+        .unwrap()
+        .execute_batch("DROP TABLE blob;")
+        .unwrap();
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(bytes.clone()));
+    assert_eq!(
+        exposition(State((Arc::new(Registry::new()), store)))
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(schema::valid(text.trim()));
+    let line: Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(line["event"], "request");
+    assert_eq!(line["level"], "error");
+    assert_eq!(line["status"].as_u64(), Some(500));
+    assert_eq!(line["path"], "/metrics");
+    assert!(line["err"].as_str().unwrap().contains("blob"));
+}
+
+#[test]
+fn migration_versions_are_logged_once_each_as_integers() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(bytes.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        log_migrations(&[1, 2]);
+        log_migrations(&[]);
+    });
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let lines: Vec<_> = text
+        .lines()
+        .map(|line| {
+            assert!(schema::valid(line));
+            serde_json::from_str::<Value>(line).unwrap()
+        })
+        .collect();
+    assert_eq!(lines.len(), 2);
+    for (index, line) in lines.iter().enumerate() {
+        assert_eq!(line["event"], "migration-applied");
+        assert_eq!(line["version"].as_u64(), Some(index as u64 + 1));
+    }
+}
+
+#[tokio::test]
+async fn request_event_keeps_http_status_an_integer() {
+    let (_root, store, _) = fixture();
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(bytes.clone()));
+    request(
+        app(store, Arc::new(Registry::new()), &config()),
+        "GET",
+        "/healthz",
+        None,
+        Body::empty(),
+    )
+    .with_subscriber(subscriber)
+    .await;
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let line: Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(line["event"], "request");
+    assert_eq!(line["status"].as_u64(), Some(200));
 }

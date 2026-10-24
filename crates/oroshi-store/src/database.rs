@@ -73,7 +73,8 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open(root: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+    /// Open the database and return the versions committed during startup.
+    pub fn open(root: impl AsRef<Path>) -> Result<(Self, Vec<usize>), DatabaseError> {
         let directory = root.as_ref().join("db");
         crate::create_dir_all_durable(&directory, &mut crate::sync_directory)?;
         let path = directory.join("oroshi.sqlite");
@@ -85,11 +86,14 @@ impl Database {
             return Err(io::Error::other("SQLite did not enable WAL mode").into());
         }
         writer.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
-        migrate(&mut writer, MIGRATIONS)?;
-        Ok(Self {
-            path,
-            writer: Mutex::new(writer),
-        })
+        let applied = migrate(&mut writer, MIGRATIONS)?;
+        Ok((
+            Self {
+                path,
+                writer: Mutex::new(writer),
+            },
+            applied,
+        ))
     }
 
     /// Total bytes of registered blobs, counting each content hash once.
@@ -274,15 +278,15 @@ fn check_version(connection: &Connection, supported: usize) -> Result<usize, Dat
     Ok(found as usize)
 }
 
-fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<(), DatabaseError> {
+fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<Vec<usize>, DatabaseError> {
     let version = check_version(connection, migrations.len())?;
+    let transaction = connection.transaction()?;
     for (index, sql) in migrations.iter().enumerate().skip(version) {
-        let transaction = connection.transaction()?;
         transaction.execute_batch(sql)?;
         transaction.pragma_update(None, "user_version", index + 1)?;
-        transaction.commit()?;
     }
-    Ok(())
+    transaction.commit()?;
+    Ok((version + 1..=migrations.len()).collect())
 }
 
 #[cfg(test)]
