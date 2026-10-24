@@ -172,3 +172,107 @@ fn serve_emits_start_before_reporting_bind_failure() {
     }
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::os::unix::net::UnixDatagram;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct Service(Child);
+    impl Drop for Service {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let directory =
+        Directory(std::env::temp_dir().join(format!("oroshi-lifecycle-{}", std::process::id())));
+    std::fs::create_dir(&directory.0).unwrap();
+    let socket = directory.0.join("notify.sock");
+    let receiver = UnixDatagram::bind(&socket).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let config = directory.0.join("config.toml");
+    std::fs::write(
+        &config,
+        "[server]\nlisten = '127.0.0.1:0'\n[metrics]\nlisten = '127.0.0.1:0'\n",
+    )
+    .unwrap();
+    for signal in ["-TERM", "-INT"] {
+        let mut service = Service(
+            Command::new(env!("CARGO_BIN_EXE_oroshi"))
+                .env("RUST_LOG", "info")
+                .env("NOTIFY_SOCKET", &socket)
+                .args(["serve", "--config"])
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut buffer = [0; 64];
+        let size = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..size], b"READY=1");
+        assert!(
+            Command::new("kill")
+                .args([signal, &service.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let size = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..size], b"STOPPING=1");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = service.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "service failed to stop");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "{status}");
+        let mut stderr = Vec::new();
+        service
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        let lines: Vec<_> = stderr
+            .split_inclusive(|&b| b == b'\n')
+            .map(log_line)
+            .collect();
+        let events: Vec<_> = lines
+            .iter()
+            .map(|line| line["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "start",
+                "listening",
+                "metrics-listening",
+                "ready",
+                "stopping"
+            ]
+        );
+        // Both ephemeral listeners must have been bound before readiness.
+        for line in &lines[1..=2] {
+            let addr: std::net::SocketAddr = line["addr"].as_str().unwrap().parse().unwrap();
+            assert_ne!(addr.port(), 0);
+            assert!(TcpStream::connect(addr).is_err());
+        }
+    }
+}

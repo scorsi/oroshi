@@ -1,4 +1,7 @@
+use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::io;
+use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,6 +12,8 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::metrics::{self, Code, Method, Module, Registry};
@@ -33,6 +38,14 @@ impl Server {
     }
 
     pub async fn run(self) -> io::Result<()> {
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let shutdown = async move {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+        };
         let registry = Arc::new(Registry::new());
         let app = Router::new()
             .route("/healthz", get(|| async { StatusCode::OK }))
@@ -41,19 +54,69 @@ impl Server {
                 registry.clone(),
                 count_request,
             ));
-        let main = axum::serve(self.main, app);
-        if let Some(listener) = self.metrics {
-            let app = Router::new()
-                .route("/metrics", get(exposition))
-                .with_state(registry);
-            tokio::select! {
-                result = main => result,
-                result = axum::serve(listener, app) => result,
+        self.serve(app, registry, shutdown, std::env::var_os("NOTIFY_SOCKET"))
+            .await
+    }
+
+    async fn serve(
+        self,
+        app: Router,
+        registry: Arc<Registry>,
+        shutdown: impl Future<Output = ()>,
+        notify_socket: Option<OsString>,
+    ) -> io::Result<()> {
+        let (stop, mut main_stop) = watch::channel(false);
+        let mut metrics_stop = main_stop.clone();
+        let main = axum::serve(self.main, app).with_graceful_shutdown(async move {
+            let _ = main_stop.changed().await;
+        });
+        let metrics = async move {
+            if let Some(listener) = self.metrics {
+                let app = Router::new()
+                    .route("/metrics", get(exposition))
+                    .with_state(registry);
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = metrics_stop.changed().await;
+                    })
+                    .await?;
             }
-        } else {
-            main.await
+            Ok::<_, io::Error>(())
+        };
+        let servers = async { tokio::try_join!(main, metrics).map(|_| ()) };
+        notify(notify_socket.as_deref(), "READY=1")?;
+        tracing::info!(event = "ready");
+        tokio::pin!(servers);
+        tokio::select! {
+            result = &mut servers => result,
+            () = shutdown => {
+                tracing::info!(event = "stopping");
+                let notified = notify(notify_socket.as_deref(), "STOPPING=1");
+                stop.send_replace(true);
+                servers.await?;
+                notified
+            }
         }
     }
+}
+
+fn notify(socket: Option<&OsStr>, state: &str) -> io::Result<()> {
+    let Some(socket) = socket else {
+        return Ok(());
+    };
+    let datagram = UnixDatagram::unbound()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::SocketAddr;
+
+        if let Some(name) = socket.as_bytes().strip_prefix(b"@") {
+            let addr = SocketAddr::from_abstract_name(name)?;
+            return datagram.send_to_addr(state.as_bytes(), &addr).map(|_| ());
+        }
+    }
+    datagram.send_to(state.as_bytes(), socket).map(|_| ())
 }
 
 async fn count_request(
@@ -127,6 +190,92 @@ mod tests {
             "[server]\nlisten = '127.0.0.1:0'"
         })
         .unwrap()
+    }
+
+    #[test]
+    fn notification_without_socket_is_a_noop() {
+        notify(None, "READY=1").unwrap();
+        notify(None, "STOPPING=1").unwrap();
+    }
+
+    #[test]
+    fn notification_to_missing_socket_reports_error() {
+        assert!(notify(Some(OsStr::new("")), "READY=1").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn notifications_support_abstract_sockets() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+
+        let name = format!("oroshi-notify-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let receiver = UnixDatagram::bind_addr(&addr).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let socket = OsString::from(format!("@{name}"));
+        for state in ["READY=1", "STOPPING=1"] {
+            notify(Some(&socket), state).unwrap();
+            let mut buffer = [0; 64];
+            let size = receiver.recv(&mut buffer).unwrap();
+            assert_eq!(&buffer[..size], state.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_in_flight_request() {
+        let server = Server::bind(&config(true)).await.unwrap();
+        let main = server.main.local_addr().unwrap();
+        let metrics = server.metrics.as_ref().unwrap().local_addr().unwrap();
+        let (entered, mut started) = watch::channel(false);
+        let (release, finished) = watch::channel(false);
+        let app = Router::new().route(
+            "/blocked",
+            get(move || {
+                let entered = entered.clone();
+                let mut finished = finished.clone();
+                async move {
+                    entered.send_replace(true);
+                    finished.changed().await.unwrap();
+                    "completed"
+                }
+            }),
+        );
+        let (stop, mut shutdown) = watch::channel(false);
+        let mut running = Running(tokio::spawn(server.serve(
+            app,
+            Arc::new(Registry::new()),
+            async move { shutdown.changed().await.unwrap() },
+            None,
+        )));
+        let response = tokio::spawn(async move { request(main, "GET", "/blocked").await });
+        timeout(Duration::from_secs(5), started.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.send_replace(true);
+        assert!(
+            timeout(Duration::from_millis(50), &mut running.0)
+                .await
+                .is_err()
+        );
+        release.send_replace(true);
+        let response = timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.ends_with("completed"));
+        timeout(Duration::from_secs(5), &mut running.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for addr in [main, metrics] {
+            assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        }
     }
 
     #[tokio::test]
