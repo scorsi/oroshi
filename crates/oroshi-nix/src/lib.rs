@@ -4,6 +4,8 @@ use std::fmt;
 
 mod narinfo;
 pub use narinfo::NarInfo;
+mod signature;
+pub use signature::{PublicKey, Signature};
 
 const BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 

@@ -3,3 +3,9 @@ key: nix key generate-secret --key-name test.example.org-1 (throwaway, secret no
 cache:      nix copy --to "file://$DIR/cache?compression=xz&secret-key=secret.key" <hello-2.12.3>
 cache-zstd: nix copy --to "file://$DIR/cache-zstd?compression=zstd" <hello-2.12.3>
 Paths substituted from cache.nixos.org keep its signature (cache.nixos.org-1); libiconv references itself.
+
+Signature verification keys (copied from the orchestrator's fixture output):
+test.example.org-1.pub: nix key convert-secret-to-public < secret.key
+cache.nixos.org-1.pub: upstream public key for the retained cache.nixos.org-1 signatures.
+The throwaway test key signs both cache-*.narinfo xz fixtures; the upstream key
+signs all four fixtures. The cache-zstd-* fixtures carry only upstream signatures.
