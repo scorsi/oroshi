@@ -1,0 +1,18 @@
+# Generated with Nix 2.34.8+1; pure commands, no daemon required.
+# Columns: algorithm hex nix32
+# nix --extra-experimental-features nix-command hash convert --hash-algo md5 --from base16 --to nix32 00000000000000000000000000000000
+md5 00000000000000000000000000000000 00000000000000000000000000
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha1 --from base16 --to nix32 000102030405060708090a0b0c0d0e0f10111213
+sha1 000102030405060708090a0b0c0d0e0f10111213 2c91240g1q6hq2qa1440f1h50h1h4080
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --from base16 --to nix32 0000000000000000000000000000000000000000000000000000000000000000
+sha256 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --from base16 --to nix32 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+sha256 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --from base16 --to nix32 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+sha256 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 07qy3lf1n6hr30bic58l2c91240g1q6hq2qa1440f1h50h1h4080
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --from base16 --to nix32 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --from base16 --to nix32 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+sha256 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad 1b8m03r63zqhnjf7l5wnldhh7c134ap5vpj0850ymkq1iyzicy5s
+# nix --extra-experimental-features nix-command hash convert --hash-algo sha512 --from base16 --to nix32 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+sha512 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f 0zkwg9w7cx3jf1p6qsk8crj64q2ybid5hmjla984wk2a91348hj07qy3lf1n6hr30bic58l2c91240g1q6hq2qa1440f1h50h1h4080

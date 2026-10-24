@@ -11,6 +11,7 @@ let
         (craneLib.fileset.commonCargoSources ../.)
         ./example.toml
         ../apps/oroshi/tests/fixtures
+        ../crates/oroshi-nix/tests/fixtures
       ];
     };
   };
