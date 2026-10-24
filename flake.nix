@@ -112,6 +112,11 @@
               self = inputs.self;
               inherit (inputs) nisshi masu;
             };
+            tls-boundary = import ./nix/test-tls-boundary.nix {
+              inherit pkgs system;
+              self = inputs.self;
+              inherit (inputs) nisshi masu;
+            };
             service = import ./nix/test-service.nix {
               inherit pkgs system;
               self = inputs.self;

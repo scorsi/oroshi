@@ -1,0 +1,5 @@
+nix (Nix) 2.34.8+1
+Throwaway signing key for the tls-boundary nixosTest only (ADR 0012 fixtures):
+signing.sec: nix key generate-secret --key-name tls-boundary.example.org-1
+signing.pub: nix key convert-secret-to-public < signing.sec
+The TLS CA and server certificate are generated at build time in nix/test-tls-boundary.nix.
