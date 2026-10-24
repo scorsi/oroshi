@@ -247,19 +247,25 @@ pkgs.testers.runNixOSTest {
         assert {path: narinfo(path) for path in (b, a)} == initial
         assert cache.succeed(blob_snapshot) == blobs_before
 
-    with subtest("remote signing merges a second signature and preserves metadata"):
+    with subtest("remote signing merges only trusted signatures and preserves metadata"):
+        # second.example.org-1 is not trusted: the upload succeeds but its signature is not stored (ADR 0016).
         builder.succeed(f"nix store sign --store ${cacheUrl} --key-file /root/second.sec {a}")
+        assert narinfo(a) == initial[a], narinfo(a)
+        # Trust the upstream key for this step only; the mixed-closure subtest needs it untrusted first.
+        start_cache(trust_upstream=True)
+        builder.succeed(f"nix store sign --store ${cacheUrl} --key-file /root/upstream.sec {a}")
         merged = narinfo(a)
         sigs = signatures(merged)
         assert len(sigs) == 2 and signatures(initial[a]) < sigs, merged
-        assert any(sig.startswith("Sig: second.example.org-1:") for sig in sigs), merged
+        assert any(sig.startswith("Sig: upstream.example.org-1:") for sig in sigs), merged
         assert [line for line in merged.splitlines() if not line.startswith("Sig: ")] == [
             line for line in initial[a].splitlines() if not line.startswith("Sig: ")
         ], merged
         assert narinfo(b) == initial[b]
         assert cache.succeed(blob_snapshot) == blobs_before
         out = host.succeed(f"nix path-info --store ${cacheUrl} --option narinfo-cache-positive-ttl 0 --sigs {a}")
-        assert "builder.example.org-1:" in out and "second.example.org-1:" in out, out
+        assert "builder.example.org-1:" in out and "upstream.example.org-1:" in out, out
+        start_cache()
 
     journal = "journalctl _SYSTEMD_UNIT=oroshi.service -o cat --no-pager"
     refusal_events = ("upload-refused", "auth-refused")

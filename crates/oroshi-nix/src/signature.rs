@@ -90,6 +90,18 @@ impl NarInfo {
         }
     }
 
+    /// Keep only well-formed signatures that verify against `trusted_keys` (merge input, ADR 0016).
+    pub fn retain_trusted_signatures(&mut self, trusted_keys: &[PublicKey]) {
+        let fingerprint = self.fingerprint();
+        self.signatures.retain(|value| {
+            value.parse::<Signature>().is_ok_and(|signature| {
+                trusted_keys
+                    .iter()
+                    .any(|key| key.verify(&fingerprint, &signature))
+            })
+        });
+    }
+
     /// Union Sig lines in first-seen order, refusing any other metadata difference.
     pub fn merge_signatures(&mut self, other: &Self) -> Result<(), ParseError> {
         let mut metadata = other.clone();

@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use oroshi_nix::{NarInfo, ParseError, parse_store_path};
+use oroshi_nix::{MAX_NARINFO_BYTES, NarInfo, ParseError, PublicKey, parse_store_path};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::Blob;
@@ -31,6 +31,7 @@ pub enum DatabaseError {
     MissingNar,
     FileHashMismatch,
     FileSizeMismatch,
+    NarinfoTooLarge,
     InvalidNarinfo(ParseError),
 }
 
@@ -53,6 +54,7 @@ impl fmt::Display for DatabaseError {
             Self::FileSizeMismatch => {
                 f.write_str("narinfo FileSize differs from the registered NAR")
             }
+            Self::NarinfoTooLarge => f.write_str("merged narinfo exceeds the size cap"),
             Self::InvalidNarinfo(error) => write!(f, "invalid stored narinfo: {error}"),
             Self::WriterPoisoned => f.write_str("database writer lock poisoned"),
         }
@@ -197,11 +199,13 @@ impl Database {
     /// The NAR must already be registered by its upload, with the narinfo's FileHash and
     /// FileSize; both are checked inside the transaction. Foreign keys refuse absent
     /// dependencies; inserting the narinfo first permits its self-edge (ADR 0005).
-    /// Existing paths merge signatures only; all other metadata is immutable.
+    /// Existing paths merge signatures only, and only those verifying against `trusted_keys`;
+    /// a merged result above `MAX_NARINFO_BYTES` is refused. All other metadata is immutable.
     /// `accessed_at` is Unix time in seconds.
     pub fn commit_narinfo(
         &self,
         info: &NarInfo,
+        trusted_keys: &[PublicKey],
         source: &str,
         accessed_at: i64,
     ) -> Result<(), DatabaseError> {
@@ -232,12 +236,18 @@ impl Database {
             .optional()?;
         if let Some(content) = existing {
             let mut stored: NarInfo = content.parse().map_err(DatabaseError::InvalidNarinfo)?;
+            let mut incoming = info.clone();
+            incoming.retain_trusted_signatures(trusted_keys);
             stored
-                .merge_signatures(info)
+                .merge_signatures(&incoming)
                 .map_err(|_| DatabaseError::NarinfoConflict)?;
+            let merged = stored.to_string();
+            if merged.len() > MAX_NARINFO_BYTES {
+                return Err(DatabaseError::NarinfoTooLarge);
+            }
             transaction.execute(
                 "UPDATE narinfo SET content = ?2 WHERE store_hash = ?1",
-                rusqlite::params![path.hash, stored.to_string()],
+                rusqlite::params![path.hash, merged],
             )?;
             transaction.commit()?;
             return Ok(());

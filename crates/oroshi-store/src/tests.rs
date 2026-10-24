@@ -277,3 +277,19 @@ fn directory_creation_propagates_sync_failure_before_creating_children() {
     assert_eq!(error.to_string(), "injected directory sync failure");
     assert!(!state.join("db").exists());
 }
+
+#[test]
+fn expired_deadline_refuses_publication_and_removes_temp_file() {
+    let root = tempfile::tempdir().unwrap();
+    let store = BlobStore::open(root.path()).unwrap();
+    let hash: [u8; 32] = Sha256::digest(b"abc").into();
+    let error = store
+        .write_until(&b"abc"[..], 3, None, Some(std::time::Instant::now()))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "deadline");
+    assert!(!store.blob_path(&hash).exists());
+    assert_empty(&root.path().join("tmp"));
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(store.write_until(&b"abc"[..], 3, None, Some(later)).is_ok());
+}

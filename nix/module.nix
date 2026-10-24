@@ -110,7 +110,12 @@ in
       maxBytes = mkOption {
         type = types.nullOr types.ints.unsigned;
         default = null;
-        description = "Maximum stored blob bytes; null disables the capacity limit.";
+        description = ''
+          Maximum stored blob bytes. Required until garbage collection ships: without a
+          collector an uncapped store only grows. A logical cap on registered blob bytes;
+          it does not count filesystem overhead, inodes, SQLite or orphans, so the
+          deployment also sets a filesystem quota.
+        '';
       };
       gcTargetRatio = mkOption {
         type = types.float;
@@ -180,6 +185,10 @@ in
         # Clients reach oroshi only through the TLS proxy (ADR 0010); the unit also denies non-local peers.
         assertion = isLoopback serverListen;
         message = "services.oroshi.listen must be a loopback socket address.";
+      }
+      {
+        assertion = (settings.storage.max_bytes or null) != null;
+        message = "services.oroshi.storage.maxBytes must be set: oroshi has no garbage collector yet, so an uncapped store can fill the disk.";
       }
       {
         assertion = lib.hasPrefix "/" stateDir;

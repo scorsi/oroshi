@@ -3,7 +3,7 @@
 use std::fmt;
 
 mod narinfo;
-pub use narinfo::NarInfo;
+pub use narinfo::{MAX_NARINFO_BYTES, NarInfo};
 mod signature;
 pub use signature::{PublicKey, Signature};
 

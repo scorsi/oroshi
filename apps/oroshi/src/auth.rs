@@ -111,11 +111,20 @@ pub async fn require_scope(
         .unwrap_or((StatusCode::UNAUTHORIZED, "unknown"));
     if status != StatusCode::OK {
         tokens.registry.auth_refusals(tokens.module).add(1);
-        tracing::warn!(
-            event = "auth-refused",
-            module = tokens.module.label(),
-            token = name
-        );
+        // A request without credentials is routine (clients wait for the challenge): info, not warn.
+        if request.headers().contains_key(header::AUTHORIZATION) {
+            tracing::warn!(
+                event = "auth-refused",
+                module = tokens.module.label(),
+                token = name
+            );
+        } else {
+            tracing::info!(
+                event = "auth-refused",
+                module = tokens.module.label(),
+                token = name
+            );
+        }
     }
     let mut response = match status {
         StatusCode::OK => return next.run(request).await,

@@ -22,6 +22,7 @@ pkgs.testers.runNixOSTest {
       enable = true;
       inherit stateDir;
       metrics.listen = "127.0.0.1:9000";
+      storage.maxBytes = 1073741824;
     };
     environment.systemPackages = [ pkgs.curl ];
   };

@@ -21,6 +21,7 @@ All ADRs are **Accepted** (2026-10-24). An accepted ADR is not modified: it is s
 | [0013](0013-versions-compatibility.md) | Versions, migrations and compatibility | Accepted |
 | [0014](0014-deployment-requirements.md) | Deployment requirements | Accepted |
 | [0015](0015-decisions-taken-during-o0-and-o1.md) | Decisions taken during O0 and O1 | Accepted |
+| [0016](0016-security-review-decisions-o1.md) | Decisions from the O1 security review | Accepted |
 
 Deployment values (addresses, ports, keys, token hashes, host selection and capacity) are not recorded here: they live in the deployment repository.
 

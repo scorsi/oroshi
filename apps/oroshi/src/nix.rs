@@ -11,7 +11,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use oroshi_nix::{NarInfo, PublicKey, decode_base32, parse_sha256, parse_store_path};
+use oroshi_nix::{
+    MAX_NARINFO_BYTES, NarInfo, PublicKey, decode_base32, parse_sha256, parse_store_path,
+};
 use oroshi_store::{BlobStore, Database, DatabaseError};
 use tokio::time::{Duration, Instant, timeout_at};
 use tokio_util::io::ReaderStream;
@@ -28,7 +30,7 @@ pub struct Store {
     pub uploads: Uploads,
 }
 
-const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Concurrent NAR uploads; each holds a blocking-pool thread while streaming.
 pub(crate) const UPLOAD_CONCURRENCY: usize = 32;
 
@@ -146,6 +148,14 @@ impl From<StatusCode> for UploadError {
     }
 }
 
+/// The upload deadline runs until the database commit (ADR 0016).
+fn check_deadline(deadline: Instant) -> Result<(), UploadError> {
+    if Instant::now() >= deadline {
+        return Err(UploadError(StatusCode::REQUEST_TIMEOUT, "deadline"));
+    }
+    Ok(())
+}
+
 fn read_failure(error: &io::Error) -> UploadError {
     if error.kind() == io::ErrorKind::TimedOut {
         UploadError(
@@ -239,13 +249,14 @@ async fn put_narinfo(
         .ok_or(UploadError(StatusCode::FORBIDDEN, "bad-name"))?
         .to_owned();
     let reader = UploadReader::new(body, &store.limits);
+    let deadline = reader.deadline;
     let bytes = tokio::task::spawn_blocking(move || {
         let mut bytes = Vec::new();
         reader
-            .take(64 * 1024 + 1)
+            .take(MAX_NARINFO_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| read_failure(&error))?;
-        if bytes.len() > 64 * 1024 {
+        if bytes.len() > MAX_NARINFO_BYTES {
             return Err(UploadError(StatusCode::PAYLOAD_TOO_LARGE, "too-large"));
         }
         Ok(bytes)
@@ -289,15 +300,21 @@ async fn put_narinfo(
             .strip_prefix("nar/")
             .ok_or_else(|| failure("bad-name"))?;
         file_hash(file).ok_or_else(|| failure("bad-name"))?;
+        info.check_unsigned_fields()
+            .map_err(|_| failure("invalid-narinfo"))?;
+        check_deadline(deadline)?;
         store
             .database
-            .commit_narinfo(&info, "upload", now()?)
+            .commit_narinfo(&info, &store.trusted_keys, "upload", now()?)
             .map_err(|error| match error {
                 DatabaseError::NarinfoConflict => UploadError(StatusCode::CONFLICT, "conflict"),
                 DatabaseError::MissingReference => failure("missing-reference"),
                 DatabaseError::MissingNar => failure("missing-nar"),
                 DatabaseError::FileHashMismatch => failure("hash-mismatch"),
                 DatabaseError::FileSizeMismatch => failure("file-size-mismatch"),
+                DatabaseError::NarinfoTooLarge => {
+                    UploadError(StatusCode::PAYLOAD_TOO_LARGE, "too-large")
+                }
                 _ => internal(error),
             })?;
         Ok((
@@ -487,6 +504,7 @@ async fn put_nar(
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
     let reader = UploadReader::new(body, &store.limits);
+    let deadline = reader.deadline;
     let permit = timeout_at(
         reader.deadline.min(reader.idle_deadline),
         store.uploads.permits.clone().acquire_owned(),
@@ -557,7 +575,7 @@ async fn put_nar(
         let cap = max_nar_bytes.min(remaining);
         let blob = store
             .blobs
-            .write(reader, cap, Some(&hash))
+            .write_until(reader, cap, Some(&hash), Some(deadline.into_std()))
             .map_err(|error| match error.kind() {
                 io::ErrorKind::FileTooLarge if remaining < max_nar_bytes => {
                     UploadError(StatusCode::INSUFFICIENT_STORAGE, "storage-full")
@@ -570,6 +588,7 @@ async fn put_nar(
                 io::ErrorKind::InvalidInput => UploadError(StatusCode::BAD_REQUEST, "invalid-body"),
                 _ => UploadError(StatusCode::INTERNAL_SERVER_ERROR, "storage-error"),
             })?;
+        check_deadline(deadline)?;
         store
             .database
             .register_nar(&format!("nar/{file}"), &blob, now()?)

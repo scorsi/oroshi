@@ -120,10 +120,13 @@ server {
 
 Preserve `/nix`; permit continuous transfers without a conflicting total size or
 duration limit. oroshi still enforces upload caps, a total deadline shorter than
-half the orphan grace, and a 60-second idle timeout. Clients must never access the
+half the orphan grace, and a 60-second idle timeout on upload bodies and on
+responses a client stops reading. Clients must never access the
 plain HTTP backend directly. The service also requires one serving instance per
 state directory on a durable local filesystem with atomic rename, file/directory
-fsync and SQLite WAL locking; leave disk headroom beyond `storage.maxBytes`.
+fsync and SQLite WAL locking; leave disk headroom beyond `storage.maxBytes`, which
+the NixOS module requires until garbage collection ships. It is a logical cap on
+blob bytes: bound the filesystem with a quota as well.
 
 ## Refusals
 
@@ -135,7 +138,7 @@ authentication failures are logged as `auth-refused`.
 | --- | --- | --- |
 | 401 | Authentication | Missing, malformed or unknown token; challenges with `WWW-Authenticate: Basic realm="oroshi"`. |
 | 403 | Authentication | Known token without `nix:write`. |
-| 400 | `invalid-body`, `invalid-narinfo` | Unreadable body or malformed narinfo. |
+| 400 | `invalid-body`, `invalid-narinfo` | Unreadable body or malformed narinfo, including a `Compression` outside none/xz/zstd/bzip2 or not matching the URL suffix, and a malformed `CA`. |
 | 400 | `bad-name` | Invalid store path or NAR URL in narinfo. |
 | 400 | `hash-mismatch`, `file-size-mismatch` | NAR hash, StorePath URL hash, FileHash or FileSize mismatch. |
 | 400 | `unsigned`, `untrusted-key` | No signature, or no valid signature from a trusted key. |
@@ -143,7 +146,7 @@ authentication failures are logged as `auth-refused`.
 | 403 | `bad-name` | Unsupported PUT path, NAR filename or compression suffix. |
 | 408 | `idle`, `deadline` | Idle timeout or total upload deadline. |
 | 409 | `conflict` | Existing narinfo differs beyond signatures. |
-| 413 | `too-large` | NAR exceeds `nix.maxNarBytes`, or narinfo exceeds 64 KiB. |
+| 413 | `too-large` | NAR exceeds `nix.maxNarBytes`, or narinfo exceeds 64 KiB, before or after merging signatures. |
 | 415 | `unsupported-encoding` | Content-Encoding other than identity; NAR compression belongs in the filename. |
 | 500 | `storage-error` | Internal storage/worker failure. |
 | 507 | `storage-full` | Upload would exceed `storage.maxBytes`. |

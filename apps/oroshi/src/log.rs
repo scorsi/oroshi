@@ -28,7 +28,13 @@ pub fn init(level: &str) -> Result<(), String> {
 }
 
 pub fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| error("fatal", &info.to_string())));
+    // The payload is arbitrary text that could quote a request value: log only the location.
+    std::panic::set_hook(Box::new(|info| {
+        let message = info.location().map_or("panic".to_owned(), |location| {
+            format!("panic at {}:{}", location.file(), location.line())
+        });
+        error("fatal", &message);
+    }));
 }
 
 pub struct JsonLayer;
@@ -411,6 +417,11 @@ pub(crate) mod tests {
         let v: Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["event"], "fatal");
         assert_eq!(v["level"], "error");
-        assert!(v["err"].as_str().unwrap().contains("panic with a quote"));
+        let err = v["err"].as_str().unwrap();
+        assert!(
+            err.starts_with("panic at ") && err.contains("log.rs:"),
+            "{err}"
+        );
+        assert!(!err.contains("quote"), "{err}");
     }
 }

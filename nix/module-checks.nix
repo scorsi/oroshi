@@ -120,6 +120,11 @@ in
     assert !(assertionsPass { services.oroshi.listen = lib.mkForce "0.0.0.0:8080"; });
     assert !(assertionsPass { services.oroshi.settings.server.listen = "192.0.2.1:8080"; });
     assert assertionsPass { services.oroshi.listen = lib.mkForce "[::1]:8080"; };
+    assert !(assertionsPass { services.oroshi.storage.maxBytes = lib.mkForce null; });
+    assert assertionsPass {
+      services.oroshi.storage.maxBytes = lib.mkForce null;
+      services.oroshi.settings.storage.max_bytes = 4096;
+    };
     assert
       unit.serviceConfig.IPAddressAllow == "localhost" && unit.serviceConfig.IPAddressDeny == "any";
     assert unit.serviceConfig.LimitCORE == 0 && unit.serviceConfig.LimitNOFILE == 8192;

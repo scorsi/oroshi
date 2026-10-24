@@ -206,3 +206,69 @@ fn unknown_fields_and_malformed_lines_are_refused() {
         );
     }
 }
+
+#[test]
+fn compression_must_be_known_and_match_the_url_suffix() {
+    let base: NarInfo = HELLO.parse().unwrap();
+    for (compression, suffix) in [
+        (Some("none"), ".nar"),
+        (Some("xz"), ".nar.xz"),
+        (Some("zstd"), ".nar.zst"),
+        (Some("bzip2"), ".nar.bz2"),
+        (None, ".nar.bz2"),
+    ] {
+        let mut info = base.clone();
+        info.compression = compression.map(str::to_owned);
+        info.url = format!("nar/x{suffix}");
+        assert!(info.check_unsigned_fields().is_ok(), "{compression:?}");
+        for other in [".nar", ".nar.xz", ".nar.zst", ".nar.bz2"] {
+            if other != suffix {
+                info.url = format!("nar/x{other}");
+                assert!(
+                    info.check_unsigned_fields().is_err(),
+                    "{compression:?} {other}"
+                );
+            }
+        }
+    }
+    let mut info = base;
+    for compression in ["gzip", "XZ", "zst", ""] {
+        info.compression = Some(compression.into());
+        info.url = "nar/x.nar.zst".into();
+        assert!(info.check_unsigned_fields().is_err(), "{compression}");
+    }
+}
+
+#[test]
+fn content_address_must_be_well_formed() {
+    let mut info: NarInfo = HELLO.parse().unwrap();
+    let h = |bytes: usize| "1".repeat((bytes * 8).div_ceil(5));
+    for ca in [
+        format!("fixed:r:sha256:{}", h(32)),
+        format!("fixed:sha256:{}", h(32)),
+        format!("fixed:git:sha1:{}", h(20)),
+        format!("fixed:md5:{}", h(16)),
+        format!("fixed:r:sha512:{}", h(64)),
+        format!("text:sha256:{}", h(32)),
+    ] {
+        info.ca = Some(ca.clone());
+        assert!(info.check_unsigned_fields().is_ok(), "{ca}");
+    }
+    for ca in [
+        "x".repeat(1000),
+        "fixed:sha256:example".into(),
+        format!("fixed:sha256:{}", h(20)),
+        format!("fixed:r:sha256:{}x", h(32)),
+        format!("fixed:r:r:sha256:{}", h(32)),
+        format!("fixed:blake3:{}", h(32)),
+        format!("text:sha1:{}", h(20)),
+        format!("text:r:sha256:{}", h(32)),
+        format!("fixed:sha256:{}", "e".repeat(52)),
+        format!("fixed:sha256:{}", "z".repeat(52)),
+    ] {
+        info.ca = Some(ca.clone());
+        assert!(info.check_unsigned_fields().is_err(), "{ca}");
+    }
+    info.ca = None;
+    assert!(info.check_unsigned_fields().is_ok());
+}

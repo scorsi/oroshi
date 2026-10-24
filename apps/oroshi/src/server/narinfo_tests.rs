@@ -106,14 +106,57 @@ async fn signatures_merge_without_duplicates_or_metadata_changes() {
         .signatures
         .retain(|sig| sig.starts_with("test.example.org-1:"));
     assert_eq!(put(app.clone(), &initial).await.status(), StatusCode::OK);
+    // The upstream signature is valid but its key is not trusted here: it is not merged.
+    for _ in 0..2 {
+        assert_eq!(put(app.clone(), &full).await.status(), StatusCode::OK);
+    }
+    assert_eq!(read(app.clone(), &initial).await, initial);
+    drop(app);
+    let mut store = store;
+    Arc::get_mut(&mut store).unwrap().trusted_keys.push(
+        include_str!("../../../../crates/oroshi-nix/tests/fixtures/narinfo/cache.nixos.org-1.pub")
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    let config = Config::parse(&format!(
+        "[tokens.writer]\nsha256 = {:?}\nscopes = ['nix:write']",
+        format!("{:x}", Sha256::digest(b"secret")),
+    ))
+    .unwrap();
+    let app = super::app(store.clone(), Arc::new(Registry::new()), &config);
     for _ in 0..2 {
         assert_eq!(put(app.clone(), &full).await.status(), StatusCode::OK);
     }
     let mut expected = initial;
     expected.merge_signatures(&full).unwrap();
+    assert_eq!(expected.signatures.len(), 2);
     assert_eq!(read(app.clone(), &expected).await, expected);
     assert_eq!(row_count(&store, "narinfo"), 1);
     assert_eq!(row_count(&store, "reference"), 1);
+}
+
+#[tokio::test]
+async fn compression_and_content_address_are_validated_before_commit() {
+    let (_root, store, app) = fixture();
+    let original = uploaded(app.clone(), LIBICONV).await;
+    for change in 0..4 {
+        let mut info = original.clone();
+        match change {
+            0 => info.compression = Some("zstd".into()),
+            1 => info.compression = Some("gzip".into()),
+            2 => info.compression = None,
+            _ => info.ca = Some("fixed:sha256:example".into()),
+        }
+        refused(
+            put(app.clone(), &info).await,
+            StatusCode::BAD_REQUEST,
+            "invalid-narinfo",
+        )
+        .await;
+    }
+    assert_eq!(row_count(&store, "narinfo"), 0);
+    assert_eq!(put(app, &original).await.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -532,10 +575,14 @@ async fn narinfo_body_cap_accepts_64_kib_and_refuses_one_more_without_reading_th
     }
     let (_root, store, app) = fixture();
     let info = uploaded(app.clone(), LIBICONV).await;
-    // CA is an opaque unsigned transport field; pad it to the exact body boundary.
+    // Pad with well-formed untrusted signatures (kept on a first upload) to the exact boundary.
     let mut wire = info.to_string();
-    let padding = 64 * 1024 - wire.len() - "CA: \n".len();
-    wire.push_str(&format!("CA: {}\n", "x".repeat(padding)));
+    let signature = |name: &str| format!("Sig: {name}:{}\n", "A".repeat(86) + "==");
+    while 64 * 1024 - wire.len() > 2 * signature("pad").len() {
+        wire.push_str(&signature("pad"));
+    }
+    let name = "p".repeat(64 * 1024 - wire.len() - signature("").len());
+    wire.push_str(&signature(&name));
     assert_eq!(wire.len(), 64 * 1024);
     assert_eq!(
         request(

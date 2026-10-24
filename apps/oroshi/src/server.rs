@@ -2,7 +2,9 @@ use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io;
 use std::os::unix::net::UnixDatagram;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -12,6 +14,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -127,6 +130,7 @@ impl Server {
 struct Limits {
     connections: usize,
     header_read_timeout: Duration,
+    write_idle_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -135,6 +139,8 @@ impl Default for Limits {
         Self {
             connections: 1024,
             header_read_timeout: Duration::from_secs(30),
+            // The upload idle timeout, applied to responses (ADR 0016).
+            write_idle_timeout: crate::nix::UPLOAD_IDLE_TIMEOUT,
         }
     }
 }
@@ -165,7 +171,7 @@ async fn serve_http(
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(limits.header_read_timeout)
             .serve_connection(
-                hyper_util::rt::TokioIo::new(stream),
+                hyper_util::rt::TokioIo::new(WriteIdle::new(stream, limits.write_idle_timeout)),
                 hyper_util::service::TowerToHyperService::new(app.clone()),
             );
         let connection = graceful.watch(connection);
@@ -177,6 +183,85 @@ async fn serve_http(
     drop(listener);
     graceful.shutdown().await;
     Ok(())
+}
+
+/// Fails a write that makes no progress for `idle`: a client that stops reading a NAR
+/// download cannot hold its connection and open blob forever.
+struct WriteIdle<S> {
+    stream: S,
+    idle: Duration,
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteIdle<S> {
+    fn new(stream: S, idle: Duration) -> Self {
+        Self {
+            stream,
+            idle,
+            stalled: None,
+        }
+    }
+
+    fn watch<T>(&mut self, cx: &mut Context<'_>, poll: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        if poll.is_ready() {
+            self.stalled = None;
+            return poll;
+        }
+        let idle = self.idle;
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "write idle timeout",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteIdle<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdle<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.stream).poll_write(cx, buf);
+        self.watch(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.stream).poll_write_vectored(cx, bufs);
+        self.watch(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut self.stream).poll_flush(cx);
+        self.watch(cx, poll)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 pub(crate) fn lock_state(root: &std::path::Path) -> io::Result<std::fs::File> {
@@ -193,6 +278,7 @@ pub(crate) fn lock_state(root: &std::path::Path) -> io::Result<std::fs::File> {
             .unwrap_or(std::path::Path::new("."));
         std::fs::File::open(parent)?.sync_all()?;
     }
+    check_state_dir(root)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -201,6 +287,52 @@ pub(crate) fn lock_state(root: &std::path::Path) -> io::Result<std::fs::File> {
     lock.try_lock()
         .map_err(|error| io::Error::other(format!("state directory lock: {error}")))?;
     Ok(lock)
+}
+
+/// Refuse a state tree that another user could redirect or rewrite (ADR 0014): the
+/// directory and each managed subdirectory that exists must be a real directory owned by
+/// this process's user and not writable by group or others.
+fn check_state_dir(root: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = process_uid()?;
+    for name in ["", "tmp", "db", "blobs", "blobs/sha256"] {
+        let path = if name.is_empty() {
+            root.to_owned()
+        } else {
+            root.join(name)
+        };
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !name.is_empty() => continue,
+            result => result?,
+        };
+        let problem = if !metadata.is_dir() {
+            "is a symlink or not a directory"
+        } else if metadata.uid() != uid {
+            "is not owned by the service user"
+        } else if metadata.mode() & 0o022 != 0 {
+            "is group- or world-writable"
+        } else {
+            continue;
+        };
+        // Name the managed path, never the configured value.
+        let label = if name.is_empty() { "" } else { "/" };
+        return Err(io::Error::other(format!(
+            "storage.dir{label}{name} {problem}"
+        )));
+    }
+    Ok(())
+}
+
+/// The standard library exposes no geteuid: a file this process creates carries its uid.
+fn process_uid() -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.subsec_nanos());
+    let path = std::env::temp_dir().join(format!("oroshi-uid-{}-{nanos}", std::process::id()));
+    let uid = std::fs::File::create_new(&path)?.metadata()?.uid();
+    std::fs::remove_file(&path)?;
+    Ok(uid)
 }
 
 fn log_migrations(applied: &[usize]) {
@@ -490,6 +622,7 @@ mod tests {
         let limits = Limits {
             connections: 1,
             header_read_timeout: Duration::from_millis(300),
+            ..Limits::default()
         };
         let _running = Running(tokio::spawn(serve_http(listener, app, stopped, limits)));
         let start = Instant::now();
@@ -609,6 +742,78 @@ mod observability_tests;
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    #[tokio::test]
+    async fn stalled_writes_fail_after_the_idle_timeout_and_progress_resets_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let idle = Duration::from_millis(100);
+        let (client, server) = tokio::io::duplex(64);
+        let mut stalled = WriteIdle::new(server, idle);
+        let started = Instant::now();
+        let error = stalled.write_all(&[0; 1024]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= idle);
+        drop(client);
+
+        let (mut client, server) = tokio::io::duplex(64);
+        let reader = tokio::spawn(async move {
+            let mut total = 0;
+            let mut buffer = [0; 64];
+            loop {
+                // Slower than the whole transfer would take, faster than the idle timeout.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                match client.read(&mut buffer).await.unwrap() {
+                    0 => return total,
+                    read => total += read,
+                }
+            }
+        });
+        let mut slow = WriteIdle::new(server, idle);
+        slow.write_all(&[0; 1024]).await.unwrap();
+        slow.shutdown().await.unwrap();
+        drop(slow);
+        assert_eq!(reader.await.unwrap(), 1024);
+    }
+
+    #[test]
+    fn state_dir_refuses_symlinks_and_shared_write_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        drop(lock_state(&state).unwrap());
+        let mode = |path: &std::path::Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&state, 0o770);
+        assert!(
+            lock_state(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("storage.dir is group")
+        );
+        mode(&state, 0o750);
+        std::fs::create_dir(state.join("tmp")).unwrap();
+        mode(&state.join("tmp"), 0o757);
+        assert!(
+            lock_state(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("storage.dir/tmp is")
+        );
+        mode(&state.join("tmp"), 0o700);
+        std::os::unix::fs::symlink(root.path(), state.join("db")).unwrap();
+        assert!(
+            lock_state(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+        std::fs::remove_file(state.join("db")).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        assert!(lock_state(&link).is_err());
+        assert!(lock_state(&state).is_ok());
+    }
+
     #[test]
     fn state_lock_refuses_second_owner_without_cleaning_uploads_and_releases_on_drop() {
         let root = tempfile::tempdir().unwrap();

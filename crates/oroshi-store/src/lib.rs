@@ -76,9 +76,21 @@ impl BlobStore {
     /// Size refusal is `FileTooLarge`; an expected-hash mismatch is `InvalidData`.
     pub fn write(
         &self,
+        reader: impl Read,
+        max_bytes: u64,
+        expected_hash: Option<&[u8; 32]>,
+    ) -> io::Result<Blob> {
+        self.write_until(reader, max_bytes, expected_hash, None)
+    }
+
+    /// Like `write`, but refuse publication once `deadline` has passed (`TimedOut`, "deadline"):
+    /// the upload deadline covers publication, not only the body (ADR 0016).
+    pub fn write_until(
+        &self,
         mut reader: impl Read,
         max_bytes: u64,
         expected_hash: Option<&[u8; 32]>,
+        deadline: Option<std::time::Instant>,
     ) -> io::Result<Blob> {
         let mut temp = TempFile::create(&self.root.join("tmp"))?;
         let mut digest = Sha256::new();
@@ -118,6 +130,9 @@ impl BlobStore {
             .publish
             .lock()
             .map_err(|_| io::Error::other("blob publication lock poisoned"))?;
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
+        }
         fs::create_dir_all(directory)?;
         File::open(directory.parent().unwrap())?.sync_all()?;
         if !sound || !path.try_exists()? {

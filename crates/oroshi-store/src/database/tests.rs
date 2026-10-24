@@ -265,6 +265,17 @@ fn hello() -> NarInfo {
     .unwrap()
 }
 
+/// Both keys that signed the fixtures.
+fn trusted_keys() -> Vec<PublicKey> {
+    [
+        include_str!("../../../oroshi-nix/tests/fixtures/narinfo/test.example.org-1.pub"),
+        include_str!("../../../oroshi-nix/tests/fixtures/narinfo/cache.nixos.org-1.pub"),
+    ]
+    .iter()
+    .map(|key| key.trim().parse().unwrap())
+    .collect()
+}
+
 fn register_nar(database: &Database, info: &NarInfo) {
     let writer = database.writer().unwrap();
     writer
@@ -322,7 +333,7 @@ fn absent_reference_refuses_commit_without_leaving_a_narinfo_or_edges() {
     let info = hello();
     register_nar(&database, &info);
     assert!(matches!(
-        database.commit_narinfo(&info, "upload", 2000),
+        database.commit_narinfo(&info, &[], "upload", 2000),
         Err(DatabaseError::MissingReference)
     ));
     assert!(stored_paths(&database).is_empty());
@@ -336,7 +347,7 @@ fn self_reference_commits_content_nar_blob_link_and_metadata() {
     let database = Database::open(root.path()).unwrap().0;
     let info = libiconv();
     register_nar(&database, &info);
-    database.commit_narinfo(&info, "upload", 2000).unwrap();
+    database.commit_narinfo(&info, &[], "upload", 2000).unwrap();
     assert_eq!(
         stored_paths(&database),
         std::slice::from_ref(&info.store_path)
@@ -380,9 +391,11 @@ fn dependency_order_allows_a_chain_and_survives_restart() {
     register_nar(&database, &dependency);
     register_nar(&database, &dependent);
     database
-        .commit_narinfo(&dependency, "upload", 2000)
+        .commit_narinfo(&dependency, &[], "upload", 2000)
         .unwrap();
-    database.commit_narinfo(&dependent, "upload", 2001).unwrap();
+    database
+        .commit_narinfo(&dependent, &[], "upload", 2001)
+        .unwrap();
     drop(database);
     let database = Database::open(root.path()).unwrap().0;
     assert_eq!(
@@ -408,7 +421,7 @@ fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
     register_nar(&database, &dependency);
     register_nar(&database, &dependent);
     database
-        .commit_narinfo(&dependency, "upload", 2000)
+        .commit_narinfo(&dependency, &[], "upload", 2000)
         .unwrap();
     // Fail on the second edge only after the first edge has actually been inserted.
     database
@@ -423,7 +436,7 @@ fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
         .unwrap();
     assert_constraint(
         database
-            .commit_narinfo(&dependent, "upload", 2001)
+            .commit_narinfo(&dependent, &[], "upload", 2001)
             .unwrap_err(),
     );
     assert_eq!(
@@ -440,7 +453,9 @@ fn constraint_failure_after_an_edge_insert_rolls_back_only_the_new_commit() {
         .unwrap()
         .execute_batch("DROP TRIGGER refuse_second_edge")
         .unwrap();
-    database.commit_narinfo(&dependent, "upload", 2001).unwrap();
+    database
+        .commit_narinfo(&dependent, &[], "upload", 2001)
+        .unwrap();
     assert_eq!(edges(&database).len(), 3);
 }
 
@@ -449,7 +464,7 @@ fn absent_nar_refuses_commit_without_rows() {
     let root = tempfile::tempdir().unwrap();
     let database = Database::open(root.path()).unwrap().0;
     assert!(matches!(
-        database.commit_narinfo(&libiconv(), "upload", 2000),
+        database.commit_narinfo(&libiconv(), &[], "upload", 2000),
         Err(DatabaseError::MissingNar)
     ));
     assert!(stored_paths(&database).is_empty());
@@ -462,11 +477,11 @@ fn duplicate_path_never_overwrites_existing_metadata() {
     let database = Database::open(root.path()).unwrap().0;
     let info = libiconv();
     register_nar(&database, &info);
-    database.commit_narinfo(&info, "upload", 2000).unwrap();
+    database.commit_narinfo(&info, &[], "upload", 2000).unwrap();
     let mut changed = info.clone();
     changed.nar_size += 1;
     assert!(matches!(
-        database.commit_narinfo(&changed, "other", 3000),
+        database.commit_narinfo(&changed, &[], "other", 3000),
         Err(DatabaseError::NarinfoConflict)
     ));
     let content: String = database
@@ -488,7 +503,7 @@ fn invalid_store_path_returns_an_error_without_writing() {
     let mut info = libiconv();
     info.store_path = "/nix/store/invalid".into();
     assert!(matches!(
-        database.commit_narinfo(&info, "upload", 2000),
+        database.commit_narinfo(&info, &[], "upload", 2000),
         Err(DatabaseError::InvalidStorePath(_))
     ));
     assert!(stored_paths(&database).is_empty());
@@ -563,7 +578,7 @@ fn accesses_to_different_entries_are_independent() {
     let dependent = hello();
     for info in [&dependency, &dependent] {
         register_nar(&database, info);
-        database.commit_narinfo(info, "upload", 1000).unwrap();
+        database.commit_narinfo(info, &[], "upload", 1000).unwrap();
     }
     let dependency_hash = parse_store_path(&dependency.store_path).unwrap().hash;
     let dependent_hash = parse_store_path(&dependent.store_path).unwrap().hash;
@@ -655,7 +670,9 @@ fn concurrent_signature_merges_preserve_both_signatures_and_original_metadata() 
     register_nar(&database, &info);
     let mut initial = info.clone();
     initial.signatures.clear();
-    database.commit_narinfo(&initial, "upload", 2000).unwrap();
+    database
+        .commit_narinfo(&initial, &[], "upload", 2000)
+        .unwrap();
     let barrier = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
         for signature in &info.signatures {
@@ -665,7 +682,9 @@ fn concurrent_signature_merges_preserve_both_signatures_and_original_metadata() 
             let barrier = &barrier;
             scope.spawn(move || {
                 barrier.wait();
-                database.commit_narinfo(&update, "other", 3000).unwrap();
+                database
+                    .commit_narinfo(&update, &trusted_keys(), "other", 3000)
+                    .unwrap();
             });
         }
     });
@@ -708,17 +727,17 @@ fn nar_file_hash_and_size_are_checked_inside_the_commit() {
     let mut wrong = info.clone();
     wrong.file_size = Some(info.file_size.unwrap() + 1);
     assert!(matches!(
-        database.commit_narinfo(&wrong, "upload", 2000),
+        database.commit_narinfo(&wrong, &[], "upload", 2000),
         Err(DatabaseError::FileSizeMismatch)
     ));
     wrong = info.clone();
     wrong.file_hash = Some([0; 32]);
     assert!(matches!(
-        database.commit_narinfo(&wrong, "upload", 2000),
+        database.commit_narinfo(&wrong, &[], "upload", 2000),
         Err(DatabaseError::FileHashMismatch)
     ));
     assert!(stored_paths(&database).is_empty());
-    database.commit_narinfo(&info, "upload", 2000).unwrap();
+    database.commit_narinfo(&info, &[], "upload", 2000).unwrap();
 }
 
 #[test]
@@ -774,4 +793,42 @@ fn readers_are_pooled_unless_left_in_a_transaction() {
     drop(reader);
     assert_ne!(cache_size(&database.reader().unwrap()), 99);
     assert_ne!(default, 1234);
+}
+
+#[test]
+fn merges_keep_only_trusted_signatures_and_refuse_oversized_results() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap().0;
+    let info = libiconv();
+    register_nar(&database, &info);
+    let content = |database: &Database| {
+        database
+            .narinfo(parse_store_path(&info.store_path).unwrap().hash)
+            .unwrap()
+            .unwrap()
+    };
+    let mut initial = info.clone();
+    initial.signatures.truncate(1);
+    // Pad the unsigned CA so one more signature crosses the cap.
+    let room = MAX_NARINFO_BYTES - initial.to_string().len() - "CA: \n".len();
+    initial.ca = Some("x".repeat(room - 10));
+    database
+        .commit_narinfo(&initial, &[], "upload", 2000)
+        .unwrap();
+    let before = content(&database);
+    let mut update = initial.clone();
+    update.signatures = info.signatures.clone();
+    update
+        .signatures
+        .push("untrusted.example.org-1:AAAA".into());
+    // Without trusting the new signer, nothing is merged and the size stays under the cap.
+    database
+        .commit_narinfo(&update, &trusted_keys()[..0], "other", 3000)
+        .unwrap();
+    assert_eq!(content(&database), before);
+    assert!(matches!(
+        database.commit_narinfo(&update, &trusted_keys(), "other", 3000),
+        Err(DatabaseError::NarinfoTooLarge)
+    ));
+    assert_eq!(content(&database), before);
 }

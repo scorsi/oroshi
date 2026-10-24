@@ -232,3 +232,20 @@ fn conflicting_merge_is_refused_without_mutation() {
         assert_eq!(info, original);
     }
 }
+
+#[test]
+fn retain_trusted_signatures_drops_untrusted_and_malformed_ones() {
+    let mut info: NarInfo = XZ[1].parse().unwrap();
+    let all = info.signatures.clone();
+    info.signatures.push("garbage".into());
+    info.signatures
+        .push(format!("other.example.org-1:{}", STANDARD.encode([0; 64])));
+    info.retain_trusted_signatures(&[key(BUILDER)]);
+    assert_eq!(info.signatures.len(), 1);
+    assert!(info.signatures[0].starts_with("test.example.org-1:"));
+    info.signatures.clone_from(&all);
+    info.retain_trusted_signatures(&[key(BUILDER), key(UPSTREAM)]);
+    assert_eq!(info.signatures, all);
+    info.retain_trusted_signatures(&[]);
+    assert!(info.signatures.is_empty());
+}

@@ -142,7 +142,10 @@ async fn auth_refusals_are_single_lines_and_never_log_token_material() {
         let line = &lines[0];
         assert_fields(line, &["module", "token"]);
         assert_eq!(line["event"], "auth-refused");
-        assert_eq!(line["level"], "warn");
+        assert_eq!(
+            line["level"],
+            if credential.is_none() { "info" } else { "warn" }
+        );
         assert_eq!(line["module"], "nix");
         assert_eq!(line["token"], name);
         for material in [

@@ -391,7 +391,8 @@ fn store_open_failure_exits_without_ready_notification() {
         if failure == "layout" {
             std::fs::write(state.join("LAYOUT"), "unsupported").unwrap();
         } else {
-            std::fs::write(state.join("db"), "not a directory").unwrap();
+            // A `db` file is refused earlier by the state-directory check; break the database itself.
+            std::fs::create_dir_all(state.join("db/oroshi.sqlite")).unwrap();
         }
         let config = directory.path().join("config.toml");
         std::fs::write(

@@ -50,6 +50,7 @@ pkgs.testers.runNixOSTest {
         enable = true;
         # Default listen: 127.0.0.1:8080, reachable only by the co-located proxy.
         metrics.listen = "127.0.0.1:9000";
+        storage.maxBytes = 1073741824;
         tokens.uploader = {
           sha256 = builtins.hashString "sha256" token;
           scopes = [ "nix:write" ];

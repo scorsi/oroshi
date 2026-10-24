@@ -4,7 +4,10 @@ use std::{
     str::FromStr,
 };
 
-use crate::{ParseError, encode_base32, parse_sha256, parse_store_path};
+use crate::{ParseError, decode_base32, encode_base32, parse_sha256, parse_store_path};
+
+/// Largest narinfo accepted on upload and stored after a signature merge (ADR 0015, 0016).
+pub const MAX_NARINFO_BYTES: usize = 64 * 1024;
 
 /// StorePath, URL, NarHash and NarSize are required; other fields are optional.
 /// Sig and CA values are preserved as text; signature verification is separate.
@@ -37,6 +40,35 @@ fn full_path(base: &str) -> Result<String, ParseError> {
     let path = format!("/nix/store/{base}");
     parse_store_path(&path)?;
     Ok(path)
+}
+
+/// `text:sha256:<hash>` or `fixed:[r:|git:]<algo>:<hash>`, the hash in Nix base32,
+/// as Nix renders a content address in a narinfo.
+fn content_address(value: &str) -> bool {
+    let hash = if let Some(hash) = value.strip_prefix("text:") {
+        hash.strip_prefix("sha256:").map(|hash| (hash, 32))
+    } else if let Some(rest) = value.strip_prefix("fixed:") {
+        let rest = rest
+            .strip_prefix("r:")
+            .or_else(|| rest.strip_prefix("git:"))
+            .unwrap_or(rest);
+        rest.split_once(':').and_then(|(algo, hash)| {
+            let bytes = match algo {
+                "md5" => 16,
+                "sha1" => 20,
+                "sha256" => 32,
+                "sha512" => 64,
+                _ => return None,
+            };
+            Some((hash, bytes))
+        })
+    } else {
+        None
+    };
+    hash.is_some_and(|(hash, bytes)| {
+        hash.len() == (bytes * 8usize).div_ceil(5)
+            && decode_base32(hash).is_ok_and(|decoded| decoded.len() == bytes)
+    })
 }
 
 impl FromStr for NarInfo {
@@ -122,6 +154,25 @@ impl FromStr for NarInfo {
 }
 
 impl NarInfo {
+    /// Ingest rules for the unsigned `Compression` and `CA` fields (ADR 0016).
+    /// An absent `Compression` means bzip2, as Nix reads it.
+    pub fn check_unsigned_fields(&self) -> Result<(), ParseError> {
+        let suffix = match self.compression.as_deref().unwrap_or("bzip2") {
+            "none" => ".nar",
+            "xz" => ".nar.xz",
+            "zstd" => ".nar.zst",
+            "bzip2" => ".nar.bz2",
+            _ => return Err(ParseError("unsupported narinfo compression")),
+        };
+        if !self.url.ends_with(suffix) {
+            return Err(ParseError("compression does not match the URL suffix"));
+        }
+        match &self.ca {
+            Some(ca) if !content_address(ca) => Err(ParseError("malformed content address")),
+            _ => Ok(()),
+        }
+    }
+
     /// Nix's version-1 signing payload, without a trailing newline.
     pub fn fingerprint(&self) -> String {
         format!(
