@@ -1,0 +1,35 @@
+# Validate with: oroshi config check --config nix/example.toml
+[server]
+listen = "127.0.0.1:8080"
+
+[metrics]
+# Omit listen to disable the metrics listener. Only loopback is allowed.
+listen = "127.0.0.1:9000"
+
+[log]
+level = "info"
+access = true
+
+[storage]
+dir = "/var/lib/oroshi"
+# Omit max_bytes for no storage cap.
+max_bytes = 107374182400
+gc_target_ratio = 0.9
+
+[gc]
+# Seconds; default one hour.
+orphan_grace = 3600
+
+[retention]
+days = 30
+
+[tokens.builder]
+# Placeholder SHA-256 hash, never a token value. Replace in the deployment repository.
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+scopes = ["nix:write", "nix:pin"]
+
+[nix]
+priority = 30
+# Example public key; replace with trusted builders' keys in the deployment repository.
+trusted_keys = ["builder.example.org:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]
+max_nar_bytes = 17179869184

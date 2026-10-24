@@ -7,7 +7,10 @@ let
     cargoExtraArgs = "--locked --workspace";
     src = lib.fileset.toSource {
       root = ../.;
-      fileset = craneLib.fileset.commonCargoSources ../.;
+      fileset = lib.fileset.unions [
+        (craneLib.fileset.commonCargoSources ../.)
+        ./example.toml
+      ];
     };
   };
   cargoArtifacts = craneLib.buildDepsOnly common;

@@ -1,19 +1,51 @@
 #![forbid(unsafe_code)]
 
+pub mod config;
+
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-fn version_requested(mut args: impl Iterator<Item = OsString>) -> bool {
-    args.next().as_deref() == Some(OsStr::new("--version")) && args.next().is_none()
+#[derive(Debug, PartialEq)]
+enum Command {
+    Version,
+    ConfigCheck(PathBuf),
+}
+
+fn command(args: &[OsString]) -> Result<Command, &'static str> {
+    match args {
+        [version] if version == OsStr::new("--version") => Ok(Command::Version),
+        [config, check, path] if config == "config" && check == "check" && path != "--config" => {
+            Ok(Command::ConfigCheck(path.into()))
+        }
+        [config, check, flag, path]
+            if config == "config" && check == "check" && flag == "--config" =>
+        {
+            Ok(Command::ConfigCheck(path.into()))
+        }
+        _ => Err("usage: oroshi --version | oroshi config check [--config] <path>"),
+    }
+}
+
+fn run(args: &[OsString]) -> Result<(), String> {
+    match command(args)? {
+        Command::Version => println!("oroshi {}", env!("CARGO_PKG_VERSION")),
+        Command::ConfigCheck(path) => {
+            let input = std::fs::read_to_string(&path)
+                .map_err(|error| format!("config {}: {error}", path.display()))?;
+            config::Config::parse(&input)?;
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
-    if version_requested(std::env::args_os().skip(1)) {
-        println!("oroshi {}", env!("CARGO_PKG_VERSION"));
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("usage: oroshi --version");
-        ExitCode::FAILURE
+    match run(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -21,21 +53,40 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> Result<Command, &'static str> {
+        command(&args.iter().map(OsString::from).collect::<Vec<_>>())
+    }
+
     #[test]
     fn accepts_version() {
-        assert!(version_requested([OsString::from("--version")].into_iter()));
+        assert_eq!(parse(&["--version"]), Ok(Command::Version));
     }
 
     #[test]
-    fn refuses_missing_or_unknown_argument() {
-        assert!(!version_requested(std::iter::empty()));
-        assert!(!version_requested([OsString::from("serve")].into_iter()));
+    fn accepts_config_check_with_positional_or_flagged_path() {
+        for args in [
+            vec!["config", "check", "example.toml"],
+            vec!["config", "check", "--config", "example.toml"],
+        ] {
+            assert_eq!(
+                parse(&args),
+                Ok(Command::ConfigCheck("example.toml".into()))
+            );
+        }
     }
 
     #[test]
-    fn refuses_extra_argument() {
-        assert!(!version_requested(
-            ["--version", "extra"].map(OsString::from).into_iter()
-        ));
+    fn refuses_missing_unknown_or_extra_arguments() {
+        for args in [
+            vec![],
+            vec!["serve"],
+            vec!["--version", "extra"],
+            vec!["config", "check"],
+            vec!["config", "check", "--config"],
+            vec!["config", "check", "file", "extra"],
+            vec!["config", "check", "--config", "file", "extra"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
     }
 }
