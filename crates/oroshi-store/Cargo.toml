@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rusqlite = "0.32"
 sha2 = "0.10"
 
 [dev-dependencies]

@@ -1,9 +1,16 @@
-{ lib, craneLib }:
+{
+  lib,
+  craneLib,
+  sqlite,
+  pkg-config,
+}:
 let
   common = {
     pname = "oroshi";
     version = (lib.importTOML ../Cargo.toml).workspace.package.version;
     strictDeps = true;
+    buildInputs = [ sqlite ];
+    nativeBuildInputs = [ pkg-config ];
     cargoExtraArgs = "--locked --workspace";
     src = lib.fileset.toSource {
       root = ../.;
@@ -12,6 +19,7 @@ let
         ./example.toml
         ../apps/oroshi/tests/fixtures
         ../crates/oroshi-nix/tests/fixtures
+        ../crates/oroshi-store/src/schema.sql
       ];
     };
   };

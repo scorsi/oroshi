@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod database;
+
+pub use database::{Database, DatabaseError};
+
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
