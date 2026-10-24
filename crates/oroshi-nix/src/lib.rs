@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+mod narinfo;
+pub use narinfo::NarInfo;
+
 const BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

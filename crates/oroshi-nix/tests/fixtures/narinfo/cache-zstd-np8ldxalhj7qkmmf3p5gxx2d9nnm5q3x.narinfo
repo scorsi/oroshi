@@ -1,0 +1,10 @@
+StorePath: /nix/store/np8ldxalhj7qkmmf3p5gxx2d9nnm5q3x-libiconv-113
+URL: nar/0g55y8wa6r8lr1xjxx29ixm5ylvgmng2b09gwl7i2jrxbc7pw8i3.nar.zst
+Compression: zstd
+FileHash: sha256:0g55y8wa6r8lr1xjxx29ixm5ylvgmng2b09gwl7i2jrxbc7pw8i3
+FileSize: 1284613
+NarHash: sha256:1rknkz4lipfvwy5lbr31rrd2kvzrnaha3ydlaldbcsv7aw5s8qq7
+NarSize: 45830800
+References: np8ldxalhj7qkmmf3p5gxx2d9nnm5q3x-libiconv-113
+Deriver: mlyaxwbw5xzrsv1298vkmp3qr66hlnfg-libiconv-113.drv
+Sig: cache.nixos.org-1:uORiFdbdOv4vhgylMc+DB5kvXspQVEEnuXgFmrRiWZcBNcktkjWGRouqTknkalnydWIMUJcTmNH/0krhbtA2BA==
