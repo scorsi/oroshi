@@ -305,7 +305,7 @@ pkgs.testers.runNixOSTest {
         assert "upstream.example.org-1:" in local_sigs and "builder.example.org-1:" not in local_sigs, local_sigs
         seen = len(events())
         builder.fail(f"nix copy --to '${uploadUrl}' {u}")
-        wait_event(seen, "upload-refused", module="nix", kind="narinfo", reason="400 Bad Request")
+        wait_event(seen, "upload-refused", module="nix", kind="narinfo", reason="untrusted-key")
         assert status(f"{store_hash(u)}.narinfo") == "404"
         start_cache(trust_upstream=True)
         drv_m = builder.succeed(f"nix-instantiate /etc/oroshi-mixed.nix --argstr upstream {u}").strip()
@@ -368,25 +368,25 @@ pkgs.testers.runNixOSTest {
         assert status(nar_d) == "404"
 
     with subtest("NAR hash mismatch and oversize NARs leave no blob"):
-        refused(400, nar_r, f"/root/fresh/{nar_d}", "upload-refused", kind="nar", reason="400 Bad Request")
+        refused(400, nar_r, f"/root/fresh/{nar_d}", "upload-refused", kind="nar", reason="hash-mismatch")
         builder.succeed("head -c ${toString (maxNarBytes + 1)} /dev/urandom > /root/oversize")
         oversize = builder.succeed("nix-hash --type sha256 --flat --base32 /root/oversize").strip()
-        refused(413, f"nar/{oversize}.nar", "/root/oversize", "upload-refused", kind="nar", reason="413 Payload Too Large")
+        refused(413, f"nar/{oversize}.nar", "/root/oversize", "upload-refused", kind="nar", reason="too-large")
         assert status(nar_r) == "404" and status(f"nar/{oversize}.nar") == "404"
 
     with subtest("narinfos are refused without their NAR, trusted signature or references"):
-        def refused_narinfo(code, path, variant):
+        def refused_narinfo(code, path, variant, reason):
             refused(code, f"{store_hash(path)}.narinfo", f"/root/{variant}.narinfo", "upload-refused",
-                    kind="narinfo", reason="400 Bad Request" if code == 400 else "409 Conflict")
-        refused_narinfo(400, d, "d-trusted")
+                    kind="narinfo", reason=reason)
+        refused_narinfo(400, d, "d-trusted", "missing-nar")
         assert status(f"{store_hash(d)}.narinfo") == "404"
         for name in ("d", "r"):
             nar = variants[name]["nar"]
             assert put(nar, f"/root/fresh/{nar}") == "204"
-        for variant in ("d-unsigned", "d-untrusted"):
-            refused_narinfo(400, d, variant)
+        for variant, reason in (("d-unsigned", "unsigned"), ("d-untrusted", "untrusted-key")):
+            refused_narinfo(400, d, variant, reason)
             assert status(f"{store_hash(d)}.narinfo") == "404"
-        refused_narinfo(400, r, "r-trusted")
+        refused_narinfo(400, r, "r-trusted", "missing-reference")
         assert status(f"{store_hash(r)}.narinfo") == "404"
 
     with subtest("the same narinfos commit once valid, and a conflicting one is 409"):
@@ -394,7 +394,7 @@ pkgs.testers.runNixOSTest {
             assert put(f"{store_hash(path)}.narinfo", f"/root/{name}-trusted.narinfo") == "200"
             assert narinfo(path) == "\n".join(variants[name]["trusted"]) + "\n"
         committed_d = narinfo(d)
-        refused_narinfo(409, d, "d-conflict")
+        refused_narinfo(409, d, "d-conflict", "conflict")
         assert narinfo(d) == committed_d
 
     with subtest("nix-cache-info PUT is ignored and other PUTs are forbidden"):
@@ -402,7 +402,7 @@ pkgs.testers.runNixOSTest {
         builder.succeed("printf 'StoreDir: /nix/store\\n' > /root/nix-cache-info")
         assert put("nix-cache-info", "/root/nix-cache-info") == "204"
         assert builder.succeed("curl -fsS ${cacheUrl}/nix-cache-info") == cache_info
-        refused(403, "log/oroshi", "/root/nix-cache-info", "upload-refused", kind="other", reason="403 Forbidden")
+        refused(403, "log/oroshi", "/root/nix-cache-info", "upload-refused", kind="other", reason="bad-name")
 
     with subtest("upload and refusal metrics moved and validate"):
         cache.succeed("${validateMetrics} validate --metrics ${metrics}")
@@ -434,7 +434,7 @@ pkgs.testers.runNixOSTest {
         assert host.succeed(f"cat {r}") == f"{d}\n"
         builder.succeed("head -c 512 /dev/urandom > /root/over-cap")
         over_cap = builder.succeed("nix-hash --type sha256 --flat --base32 /root/over-cap").strip()
-        refused(507, f"nar/{over_cap}.nar", "/root/over-cap", "upload-refused", kind="nar", reason="507 Insufficient Storage")
+        refused(507, f"nar/{over_cap}.nar", "/root/over-cap", "upload-refused", kind="nar", reason="storage-full")
 
     with subtest("every cache log line and the metrics endpoint still validate"):
         cache.succeed("${validateMetrics} validate --metrics ${metrics}")
