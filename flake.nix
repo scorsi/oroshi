@@ -105,6 +105,13 @@
               system
               ;
             self = inputs.self;
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            service = import ./nix/test-service.nix {
+              inherit pkgs system;
+              self = inputs.self;
+              inherit (inputs) nisshi masu;
+            };
           };
 
           treefmt = {
