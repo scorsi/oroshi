@@ -1,4 +1,5 @@
 use std::fmt;
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -68,7 +69,7 @@ pub struct Database {
 impl Database {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let directory = root.as_ref().join("db");
-        fs::create_dir_all(&directory)?;
+        crate::create_dir_all_durable(&directory, &mut crate::sync_directory)?;
         let path = directory.join("oroshi.sqlite");
         let mut writer = Connection::open(&path)?;
         // Refuse incompatible databases before changing their persistent journal mode.

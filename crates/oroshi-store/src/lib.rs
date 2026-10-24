@@ -41,22 +41,15 @@ impl BlobStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) => return Err(error),
         };
-        fs::create_dir_all(root)?;
-        File::open(root)?.sync_all()?;
-        File::open(
-            root.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-        )?
-        .sync_all()?;
+        create_dir_all_durable(root, &mut sync_directory)?;
+        sync_directory(root)?;
         for directory in [
             root.join("tmp"),
             root.join("blobs"),
             root.join("blobs/sha256"),
         ] {
-            fs::create_dir_all(&directory)?;
-            File::open(&directory)?.sync_all()?;
-            File::open(directory.parent().unwrap())?.sync_all()?;
+            create_dir_all_durable(&directory, &mut sync_directory)?;
+            sync_directory(&directory)?;
         }
         for entry in fs::read_dir(root.join("tmp"))? {
             fs::remove_file(entry?.path())?;
@@ -182,3 +175,23 @@ impl Drop for TempFile {
 
 #[cfg(test)]
 mod tests;
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+// Persist each new ancestor before creating entries beneath it.
+fn create_dir_all_durable(
+    path: &Path,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !path.is_dir() {
+        create_dir_all_durable(parent, sync)?;
+        fs::create_dir_all(path)?;
+    }
+    sync(parent)
+}

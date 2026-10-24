@@ -333,3 +333,71 @@ fn token_hash_rejects_secret_arguments_without_echoing_them() {
         );
     }
 }
+
+#[test]
+fn config_invalid_logs_never_echo_inline_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let secret = "token-looking-secret-0123456789";
+    for input in [
+        format!("[server]\nlisten = '{secret}'"),
+        format!("[log]\nlevel = 'oroshi={secret}'"),
+        format!("unexpected = '{secret}'"),
+        format!("[nix]\ntrusted_keys = ['{secret}']"),
+    ] {
+        std::fs::write(&path, input).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+            .args(["config", "check", "--config"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(log_line(&output.stderr)["event"], "config-invalid");
+        assert!(!String::from_utf8(output.stderr).unwrap().contains(secret));
+    }
+}
+
+#[test]
+fn store_open_failure_exits_without_ready_notification() {
+    use std::os::unix::net::UnixDatagram;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("notify.sock");
+    let receiver = UnixDatagram::bind(&socket).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    for failure in ["layout", "database"] {
+        let state = directory.path().join(failure);
+        std::fs::create_dir(&state).unwrap();
+        if failure == "layout" {
+            std::fs::write(state.join("LAYOUT"), "unsupported").unwrap();
+        } else {
+            std::fs::write(state.join("db"), "not a directory").unwrap();
+        }
+        let config = directory.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[server]\nlisten = '127.0.0.1:0'\n[storage]\ndir = {:?}\n",
+                state
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+            .env("NOTIFY_SOCKET", &socket)
+            .env("RUST_LOG", "info")
+            .args(["serve", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let lines: Vec<_> = output
+            .stderr
+            .split_inclusive(|&b| b == b'\n')
+            .map(log_line)
+            .collect();
+        assert!(lines.iter().any(|line| line["event"] == "listening"));
+        assert_eq!(lines.last().unwrap()["event"], "fatal");
+        assert!(!lines.iter().any(|line| line["event"] == "ready"));
+        let error = receiver.recv(&mut [0; 64]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+}

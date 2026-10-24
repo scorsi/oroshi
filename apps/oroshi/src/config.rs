@@ -123,13 +123,42 @@ impl Default for Nix {
 
 impl Config {
     pub fn parse(input: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(input).map_err(|error| error.to_string())?;
+        let config: Self = toml::from_str(input).map_err(|error: toml::de::Error| {
+            let line = error.span().map(|span| {
+                input[..span.start]
+                    .bytes()
+                    .filter(|&byte| byte == b'\n')
+                    .count()
+                    + 1
+            });
+            // Only field names from serde diagnostics are safe to retain.
+            let field = ["unknown field `", "missing field `"]
+                .into_iter()
+                .find_map(|prefix| {
+                    error
+                        .message()
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.split_once('`'))
+                        .map(|(key, _)| format!("{} `{key}`", prefix.trim_end_matches(" `")))
+                });
+            format!(
+                "invalid configuration{}{}",
+                field.map(|field| format!(": {field}")).unwrap_or_default(),
+                line.map(|line| format!(" at line {line}"))
+                    .unwrap_or_default()
+            )
+        })?;
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<(), String> {
-        crate::log::filter(&self.log.level, None)?;
+        crate::log::filter(&self.log.level, None)
+            .map_err(|_| "log.level must be a valid log filter".to_owned())?;
+        for (index, key) in self.nix.trusted_keys.iter().enumerate() {
+            key.parse::<oroshi_nix::PublicKey>()
+                .map_err(|_| format!("nix.trusted_keys[{index}] must be a valid public key"))?;
+        }
         if let Some(listen) = self.metrics.listen
             && !listen.ip().is_loopback()
         {
@@ -175,6 +204,37 @@ mod tests {
 
     fn token(hash: &str, scopes: &str) -> String {
         format!("[tokens.builder]\nsha256 = {hash:?}\nscopes = [{scopes}]\n")
+    }
+
+    #[test]
+    fn invalid_configuration_never_echoes_values() {
+        let secret = "token-looking-secret-0123456789";
+        for input in [
+            format!("[server]\nlisten = '{secret}'"),
+            format!("[nix]\npriority = '{secret}'"),
+            format!("unexpected = '{secret}'"),
+            format!("[log]\nlevel = 'oroshi={secret}'"),
+            format!("[nix]\ntrusted_keys = ['{secret}']"),
+            format!("[server]\nlisten = '{secret}"),
+        ] {
+            let error = Config::parse(&input).unwrap_err();
+            assert!(!error.contains(secret), "{error}");
+            assert!(
+                error.contains("line")
+                    || error.contains("log.level")
+                    || error.contains("nix.trusted_keys"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_malformed_trusted_keys() {
+        for key in ["example.org:!!!!", "example.org:YQ=="] {
+            let error = Config::parse(&format!("[nix]\ntrusted_keys = [{key:?}]")).unwrap_err();
+            assert!(error.contains("nix.trusted_keys[0]"), "{error}");
+            assert!(!error.contains(key), "{error}");
+        }
     }
 
     #[test]

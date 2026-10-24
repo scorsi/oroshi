@@ -204,3 +204,51 @@ fn publication_failure_removes_temp_file() {
     assert_empty(&root.path().join("tmp"));
     assert!(!path.exists());
 }
+
+#[test]
+fn directory_creation_syncs_each_parent_before_creating_children() {
+    let root = tempfile::tempdir().unwrap();
+    for suffix in ["db", "tmp", "blobs/sha256"] {
+        let state = root.path().join(suffix.replace('/', "-")).join("state");
+        let target = state.join(suffix);
+        let mut synced = Vec::new();
+        create_dir_all_durable(&target, &mut |parent| {
+            assert!(parent.is_dir());
+            if parent == root.path() && state.exists() {
+                assert!(!target.exists());
+            }
+            sync_directory(parent)?;
+            synced.push(parent.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        let parents: Vec<_> = target
+            .ancestors()
+            .skip(1)
+            .take_while(|p| p.starts_with(root.path()))
+            .collect();
+        for parent in parents {
+            assert!(
+                synced.iter().any(|path| path == parent),
+                "{parent:?}: {synced:?}"
+            );
+        }
+        assert_eq!(synced.last().unwrap(), target.parent().unwrap());
+    }
+}
+
+#[test]
+fn directory_creation_propagates_sync_failure_before_creating_children() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let error = create_dir_all_durable(&state.join("db"), &mut |parent| {
+        if parent == root.path() && state.exists() {
+            Err(io::Error::other("injected directory sync failure"))
+        } else {
+            sync_directory(parent)
+        }
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "injected directory sync failure");
+    assert!(!state.join("db").exists());
+}
