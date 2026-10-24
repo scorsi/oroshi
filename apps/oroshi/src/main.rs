@@ -2,6 +2,7 @@
 
 pub mod config;
 mod log;
+pub mod metrics;
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
