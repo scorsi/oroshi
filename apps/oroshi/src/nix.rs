@@ -148,7 +148,7 @@ impl From<StatusCode> for UploadError {
     }
 }
 
-/// The upload deadline runs until the database commit (ADR 0016).
+/// The upload deadline runs until the database commit (ADR 0018).
 fn check_deadline(deadline: Instant) -> Result<(), UploadError> {
     if Instant::now() >= deadline {
         return Err(UploadError(StatusCode::REQUEST_TIMEOUT, "deadline"));

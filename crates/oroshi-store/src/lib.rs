@@ -84,7 +84,7 @@ impl BlobStore {
     }
 
     /// Like `write`, but refuse publication once `deadline` has passed (`TimedOut`, "deadline"):
-    /// the upload deadline covers publication, not only the body (ADR 0016).
+    /// the upload deadline covers publication, not only the body (ADR 0018).
     pub fn write_until(
         &self,
         mut reader: impl Read,

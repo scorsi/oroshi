@@ -248,7 +248,7 @@ pkgs.testers.runNixOSTest {
         assert cache.succeed(blob_snapshot) == blobs_before
 
     with subtest("remote signing merges only trusted signatures and preserves metadata"):
-        # second.example.org-1 is not trusted: the upload succeeds but its signature is not stored (ADR 0016).
+        # second.example.org-1 is not trusted: the upload succeeds but its signature is not stored (ADR 0017).
         builder.succeed(f"nix store sign --store ${cacheUrl} --key-file /root/second.sec {a}")
         assert narinfo(a) == initial[a], narinfo(a)
         # Trust the upstream key for this step only; the mixed-closure subtest needs it untrusted first.

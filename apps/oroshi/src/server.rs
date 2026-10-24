@@ -139,7 +139,7 @@ impl Default for Limits {
         Self {
             connections: 1024,
             header_read_timeout: Duration::from_secs(30),
-            // The upload idle timeout, applied to responses (ADR 0016).
+            // The upload idle timeout, applied to responses (ADR 0018).
             write_idle_timeout: crate::nix::UPLOAD_IDLE_TIMEOUT,
         }
     }

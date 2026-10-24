@@ -6,7 +6,7 @@ use std::{
 
 use crate::{ParseError, decode_base32, encode_base32, parse_sha256, parse_store_path};
 
-/// Largest narinfo accepted on upload and stored after a signature merge (ADR 0015, 0016).
+/// Largest narinfo accepted on upload and stored after a signature merge (ADR 0017).
 pub const MAX_NARINFO_BYTES: usize = 64 * 1024;
 
 /// StorePath, URL, NarHash and NarSize are required; other fields are optional.
@@ -154,7 +154,7 @@ impl FromStr for NarInfo {
 }
 
 impl NarInfo {
-    /// Ingest rules for the unsigned `Compression` and `CA` fields (ADR 0016).
+    /// Ingest rules for the unsigned `Compression` and `CA` fields (ADR 0017).
     /// An absent `Compression` means bzip2, as Nix reads it.
     pub fn check_unsigned_fields(&self) -> Result<(), ParseError> {
         let suffix = match self.compression.as_deref().unwrap_or("bzip2") {

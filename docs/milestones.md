@@ -90,7 +90,7 @@ Content: blob store and SQLite metadata with migrations (0004); Nix base32, nari
 
 **Deliverable**: the cache stays under its cap without ever breaking a closure, while uploads continue (0005).
 
-Content: access-time tracking, named roots (`/nix/_oroshi/roots/<name>`, scope `nix:pin`), `oroshi gc` (mark, re-checked deletes, blob sweep with grace, temp cleanup, size cap pass), `oroshi-gc.{service,timer}`, GC metrics and `gc-run` line, and an operator command to drop a narinfo so a path poisoned by a bad first upload can be uploaded again (0016).
+Content: access-time tracking, named roots (`/nix/_oroshi/roots/<name>`, scope `nix:pin`), `oroshi gc` (mark, re-checked deletes, blob sweep with grace, temp cleanup, size cap pass), `oroshi-gc.{service,timer}`, GC metrics and `gc-run` line, and an operator command to drop a narinfo so a path poisoned by a bad first upload can be uploaded again (0017).
 
 **Acceptance criteria**
 

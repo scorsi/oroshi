@@ -90,7 +90,7 @@ impl NarInfo {
         }
     }
 
-    /// Keep only well-formed signatures that verify against `trusted_keys` (merge input, ADR 0016).
+    /// Keep only well-formed signatures that verify against `trusted_keys` (merge input, ADR 0017).
     pub fn retain_trusted_signatures(&mut self, trusted_keys: &[PublicKey]) {
         let fingerprint = self.fingerprint();
         self.signatures.retain(|value| {
