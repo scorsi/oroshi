@@ -45,7 +45,7 @@ fn invalid_arguments_fail_with_usage() {
         assert_eq!(v["level"], "error");
         assert_eq!(
             v["err"],
-            "usage: oroshi --version | oroshi config check [--config] <path> | oroshi serve --config <path>"
+            "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path>"
         );
     }
 }
@@ -274,5 +274,62 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
             assert_ne!(addr.port(), 0);
             assert!(TcpStream::connect(addr).is_err());
         }
+    }
+}
+
+#[test]
+fn token_hash_hashes_stdin_bytes_exactly() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    for (secret, expected) in [
+        (
+            b"abc".as_slice(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            b"abc\n".as_slice(),
+            "edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb",
+        ),
+        (
+            b"".as_slice(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+            .args(["token", "hash"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(secret).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, format!("{expected}\n").as_bytes());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn token_hash_rejects_secret_arguments_without_echoing_them() {
+    for args in [
+        vec!["token", "hash", "private-secret"],
+        vec!["token", "hash", "--secret", "private-secret"],
+        vec!["token", "hash", "--secret=private-secret"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let line = log_line(&output.stderr);
+        assert!(line["err"].as_str().unwrap().starts_with("usage:"));
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("private-secret")
+        );
     }
 }

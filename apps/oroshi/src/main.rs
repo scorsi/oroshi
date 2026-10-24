@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod config;
 mod log;
 pub mod metrics;
@@ -12,6 +13,7 @@ use std::process::ExitCode;
 #[derive(Debug, PartialEq)]
 enum Command {
     Version,
+    TokenHash,
     ConfigCheck(PathBuf),
     Serve(PathBuf),
 }
@@ -19,6 +21,7 @@ enum Command {
 fn command(args: &[OsString]) -> Result<Command, &'static str> {
     match args {
         [version] if version == OsStr::new("--version") => Ok(Command::Version),
+        [token, hash] if token == "token" && hash == "hash" => Ok(Command::TokenHash),
         [serve, flag, path] if serve == "serve" && flag == "--config" => {
             Ok(Command::Serve(path.into()))
         }
@@ -31,7 +34,7 @@ fn command(args: &[OsString]) -> Result<Command, &'static str> {
             Ok(Command::ConfigCheck(path.into()))
         }
         _ => Err(
-            "usage: oroshi --version | oroshi config check [--config] <path> | oroshi serve --config <path>",
+            "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path>",
         ),
     }
 }
@@ -41,6 +44,24 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
     let serve = matches!(cmd, Command::Serve(_));
     match cmd {
         Command::Version => println!("oroshi {}", env!("CARGO_PKG_VERSION")),
+        Command::TokenHash => {
+            use sha2::{Digest, Sha256};
+            use std::io::Read;
+
+            let mut hash = Sha256::new();
+            let mut buffer = [0; 4096];
+            let mut stdin = std::io::stdin().lock();
+            loop {
+                let size = stdin
+                    .read(&mut buffer)
+                    .map_err(|error| format!("stdin: {error}"))?;
+                if size == 0 {
+                    break;
+                }
+                hash.update(&buffer[..size]);
+            }
+            println!("{:x}", hash.finalize());
+        }
         Command::ConfigCheck(path) | Command::Serve(path) => {
             let result = (|| {
                 let input = std::fs::read_to_string(&path)
