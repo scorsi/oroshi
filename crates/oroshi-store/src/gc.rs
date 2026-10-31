@@ -115,15 +115,25 @@ impl Database {
     /// seconds before `now`. `blobs` must be opened with `BlobStore::open_existing` by a
     /// second process. A file already gone is not an error.
     pub fn sweep(&self, blobs: &BlobStore, now: i64, grace: i64) -> Result<Swept, DatabaseError> {
+        let mut swept = Swept::default();
+        self.sweep_into(blobs, now, grace, &mut swept)?;
+        Ok(swept)
+    }
+
+    /// `sweep`, keeping in `swept` what was removed before a failure.
+    fn sweep_into(
+        &self,
+        blobs: &BlobStore,
+        now: i64,
+        grace: i64,
+        swept: &mut Swept,
+    ) -> Result<(), DatabaseError> {
         let cutoff = now - grace;
-        let mut swept = Swept {
-            nars: self.writer()?.execute(
-                "DELETE FROM nar WHERE registered_at <= ?1
-                 AND NOT EXISTS (SELECT 1 FROM narinfo WHERE nar_url = nar.url)",
-                [cutoff],
-            )?,
-            ..Swept::default()
-        };
+        swept.nars = self.writer()?.execute(
+            "DELETE FROM nar WHERE registered_at <= ?1
+             AND NOT EXISTS (SELECT 1 FROM narinfo WHERE nar_url = nar.url)",
+            [cutoff],
+        )?;
         let unused: Vec<[u8; 32]> = self
             .reader()?
             .prepare(
@@ -157,8 +167,68 @@ impl Database {
                 swept.temp_files += 1;
             }
         }
-        Ok(swept)
+        Ok(())
     }
+
+    /// One `oroshi gc` run (ADR 0005): mark, delete the expired then the capped paths,
+    /// sweep. `report` keeps the counts reached when an error stops the run.
+    pub fn collect(
+        &self,
+        blobs: &BlobStore,
+        policy: &Policy,
+        report: &mut Report,
+    ) -> Result<(), DatabaseError> {
+        let plan = mark(&self.gc_snapshot()?, policy);
+        for path in plan.expired.iter().chain(&plan.capped) {
+            if self.delete_marked(path)? {
+                report.deleted_entries += 1;
+            }
+        }
+        self.sweep_into(blobs, policy.now, policy.orphan_grace, &mut report.swept)
+    }
+
+    /// Count one finished run in `gc_state`; freed bytes count whatever the result.
+    pub fn record_gc_run(&self, ok: bool, freed_bytes: u64, now: i64) -> Result<(), DatabaseError> {
+        self.writer()?.execute(
+            "UPDATE gc_state SET runs_success = runs_success + ?1, runs_error = runs_error + ?2,
+             freed_bytes = freed_bytes + ?3,
+             last_success_at = CASE WHEN ?1 THEN ?4 ELSE last_success_at END",
+            rusqlite::params![ok, !ok, freed_bytes, now],
+        )?;
+        Ok(())
+    }
+
+    /// The persisted GC counters, read by the server's metrics (ADR 0011).
+    pub fn gc_state(&self) -> Result<GcState, DatabaseError> {
+        Ok(self.reader()?.query_row(
+            "SELECT runs_success, runs_error, freed_bytes, last_success_at FROM gc_state",
+            [],
+            |row| {
+                Ok(GcState {
+                    runs_success: row.get(0)?,
+                    runs_error: row.get(1)?,
+                    freed_bytes: row.get(2)?,
+                    last_success_at: row.get(3)?,
+                })
+            },
+        )?)
+    }
+}
+
+/// Counts of one `oroshi gc` run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    pub deleted_entries: usize,
+    pub swept: Swept,
+}
+
+/// The single `gc_state` row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GcState {
+    pub runs_success: u64,
+    pub runs_error: u64,
+    pub freed_bytes: u64,
+    pub last_success_at: Option<i64>,
 }
 
 /// What one sweep removed; `freed_bytes` counts blob rows and orphan files.

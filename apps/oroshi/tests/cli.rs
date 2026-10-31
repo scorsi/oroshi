@@ -45,7 +45,7 @@ fn invalid_arguments_fail_with_usage() {
         assert_eq!(v["level"], "error");
         assert_eq!(
             v["err"],
-            "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path>"
+            "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path> | oroshi gc --config <path>"
         );
     }
 }

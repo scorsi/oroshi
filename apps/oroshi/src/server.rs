@@ -292,7 +292,7 @@ pub(crate) fn lock_state(root: &std::path::Path) -> io::Result<std::fs::File> {
 /// Refuse a state tree that another user could redirect or rewrite (ADR 0014): the
 /// directory and each managed subdirectory that exists must be a real directory owned by
 /// this process's user and not writable by group or others.
-fn check_state_dir(root: &std::path::Path) -> io::Result<()> {
+pub(crate) fn check_state_dir(root: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let uid = process_uid()?;
     for name in ["", "tmp", "db", "blobs", "blobs/sha256"] {

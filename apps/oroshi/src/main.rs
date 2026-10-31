@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod config;
+mod gc;
 mod log;
 pub mod metrics;
 mod nix;
@@ -11,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path>";
+const USAGE: &str = "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path> | oroshi gc --config <path>";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -20,6 +21,7 @@ enum Command {
     TokenHash,
     ConfigCheck(PathBuf),
     Serve(PathBuf),
+    Gc(PathBuf),
 }
 
 fn command(args: &[OsString]) -> Result<Command, &'static str> {
@@ -30,6 +32,7 @@ fn command(args: &[OsString]) -> Result<Command, &'static str> {
         [serve, flag, path] if serve == "serve" && flag == "--config" => {
             Ok(Command::Serve(path.into()))
         }
+        [gc, flag, path] if gc == "gc" && flag == "--config" => Ok(Command::Gc(path.into())),
         [config, check, path] if config == "config" && check == "check" && path != "--config" => {
             Ok(Command::ConfigCheck(path.into()))
         }
@@ -50,10 +53,16 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
             return Ok(ExitCode::from(2));
         }
     };
-    let serve = matches!(cmd, Command::Serve(_));
-    match cmd {
-        Command::Help => println!("{USAGE}"),
-        Command::Version => println!("oroshi {}", env!("CARGO_PKG_VERSION")),
+    let path = match &cmd {
+        Command::ConfigCheck(path) | Command::Serve(path) | Command::Gc(path) => path,
+        Command::Help => {
+            println!("{USAGE}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Version => {
+            println!("oroshi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::TokenHash => {
             use sha2::{Digest, Sha256};
             use std::io::Read;
@@ -71,33 +80,41 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
                 hash.update(&buffer[..size]);
             }
             println!("{:x}", hash.finalize());
+            return Ok(ExitCode::SUCCESS);
         }
-        Command::ConfigCheck(path) | Command::Serve(path) => {
-            let result = (|| {
-                let input = std::fs::read_to_string(&path)
-                    .map_err(|error| format!("config {}: {error}", path.display()))?;
-                config::Config::parse(&input)
-            })();
-            let config = match result {
-                Ok(config) => config,
-                Err(error) => {
-                    log::error("config-invalid", &error);
-                    return Ok(ExitCode::FAILURE);
-                }
-            };
-            if serve {
-                log::init(&config.log.level)?;
-                tracing::info!(event = "start", version = env!("CARGO_PKG_VERSION"));
-                let _state_lock =
-                    server::lock_state(&config.storage.dir).map_err(|error| error.to_string())?;
-                server::Server::bind(&config)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .run(&config)
-                    .await
-                    .map_err(|error| error.to_string())?;
+    };
+    let result = (|| {
+        let input = std::fs::read_to_string(path)
+            .map_err(|error| format!("config {}: {error}", path.display()))?;
+        config::Config::parse(&input)
+    })();
+    let config = match result {
+        Ok(config) => config,
+        Err(error) => {
+            log::error("config-invalid", &error);
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    match cmd {
+        Command::Serve(_) => {
+            log::init(&config.log.level)?;
+            tracing::info!(event = "start", version = env!("CARGO_PKG_VERSION"));
+            let _state_lock =
+                server::lock_state(&config.storage.dir).map_err(|error| error.to_string())?;
+            server::Server::bind(&config)
+                .await
+                .map_err(|error| error.to_string())?
+                .run(&config)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Command::Gc(_) => {
+            log::init(&config.log.level)?;
+            if !gc::run(&config) {
+                return Ok(ExitCode::FAILURE);
             }
         }
+        _ => {}
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -136,6 +153,14 @@ mod tests {
     }
 
     #[test]
+    fn accepts_gc_with_config_path() {
+        assert_eq!(
+            parse(&["gc", "--config", "example.toml"]),
+            Ok(Command::Gc("example.toml".into()))
+        );
+    }
+
+    #[test]
     fn accepts_config_check_with_positional_or_flagged_path() {
         for args in [
             vec!["config", "check", "example.toml"],
@@ -156,6 +181,9 @@ mod tests {
             vec!["serve", "example.toml"],
             vec!["serve", "--config"],
             vec!["serve", "--config", "file", "extra"],
+            vec!["gc"],
+            vec!["gc", "file"],
+            vec!["gc", "--config", "file", "--dry-run"],
             vec!["--version", "extra"],
             vec!["config", "check"],
             vec!["config", "check", "--config"],
