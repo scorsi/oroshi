@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::os::unix::net::UnixDatagram;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -162,17 +163,22 @@ async fn serve_http(
             } => accepted,
             _ = stop.changed() => break,
         };
-        let (Ok(permit), Ok((stream, _))) = accepted else {
+        let (Ok(permit), Ok((stream, peer))) = accepted else {
             // Accept errors such as EMFILE are transient: back off instead of exiting.
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
         let connection = hyper::server::conn::http1::Builder::new()
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(limits.header_read_timeout)
             .serve_connection(
                 hyper_util::rt::TokioIo::new(WriteIdle::new(stream, limits.write_idle_timeout)),
-                hyper_util::service::TowerToHyperService::new(app.clone()),
+                hyper::service::service_fn(move |mut request: hyper::Request<_>| {
+                    let client = client_address(peer.ip(), request.headers());
+                    request.extensions_mut().insert(Client(client));
+                    hyper::service::Service::call(&service, request)
+                }),
             );
         let connection = graceful.watch(connection);
         tokio::spawn(async move {
@@ -183,6 +189,37 @@ async fn serve_http(
     drop(listener);
     graceful.shutdown().await;
     Ok(())
+}
+
+/// The address that logs record for a request (ADR 0029).
+#[derive(Clone, Copy)]
+pub struct Client(pub IpAddr);
+
+impl Client {
+    /// The logged `client` field; absent only for requests that did not come through a listener.
+    pub fn field(request: &Request) -> Option<tracing::field::DisplayValue<IpAddr>> {
+        request
+            .extensions()
+            .get::<Self>()
+            .map(|client| tracing::field::display(client.0))
+    }
+}
+
+/// Only the local reverse proxy, a loopback peer, may name the client: it overwrites
+/// `X-Forwarded-For` with one address, so the rightmost entry is the one it wrote.
+fn client_address(peer: IpAddr, headers: &header::HeaderMap) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !peer.is_loopback() {
+        return peer;
+    }
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|entry| entry.trim().parse::<IpAddr>().ok())
+        .map_or(peer, |client| client.to_canonical())
 }
 
 /// Fails a write that makes no progress for `idle`: a client that stops reading a NAR
@@ -397,6 +434,7 @@ async fn count_request(
     let method = Method::from(request.method().as_str());
     let read = matches!(request.method().as_str(), "GET" | "HEAD");
     let path = request.uri().path().to_owned();
+    let client = Client::field(&request);
     let module = if request
         .extensions()
         .get::<MatchedPath>()
@@ -449,7 +487,8 @@ async fn count_request(
             path,
             status = response.status().as_u16(),
             bytes,
-            dur_us = start.elapsed().as_micros() as u64
+            dur_us = start.elapsed().as_micros() as u64,
+            client
         );
     }
     response
@@ -649,6 +688,87 @@ mod tests {
             .await
             .unwrap()
             .ok();
+    }
+
+    #[test]
+    fn only_a_loopback_peer_may_name_the_client() {
+        let headers = |values: &[&str]| {
+            let mut headers = header::HeaderMap::new();
+            for value in values {
+                headers.append("x-forwarded-for", value.parse().unwrap());
+            }
+            headers
+        };
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let client = |peer, values: &[&str]| client_address(ip(peer), &headers(values)).to_string();
+        for loopback in ["127.0.0.1", "127.9.9.9", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(client(loopback, &["192.0.2.7"]), "192.0.2.7");
+            assert_eq!(client(loopback, &["2001:db8::7"]), "2001:db8::7");
+            assert_eq!(client(loopback, &["::ffff:192.0.2.7"]), "192.0.2.7");
+            // The rightmost entry is the one the proxy wrote.
+            assert_eq!(client(loopback, &["198.51.100.1, 192.0.2.7"]), "192.0.2.7");
+            assert_eq!(
+                client(loopback, &["198.51.100.1", " 192.0.2.7 "]),
+                "192.0.2.7"
+            );
+            let own = ip(loopback).to_canonical().to_string();
+            for malformed in [
+                &[][..],
+                &[""],
+                &["192.0.2.7, "],
+                &["unknown"],
+                &["192.0.2.7:80"],
+            ] {
+                assert_eq!(client(loopback, malformed), own, "{malformed:?}");
+            }
+        }
+        // Any other peer keeps its own address, whatever it claims.
+        for peer in ["192.0.2.1", "2001:db8::1", "::ffff:192.0.2.1"] {
+            let own = ip(peer).to_canonical().to_string();
+            assert_eq!(client(peer, &["127.0.0.1"]), own);
+            assert_eq!(client(peer, &["203.0.113.5"]), own);
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_attaches_the_client_to_each_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let app = Router::new().route(
+            "/client",
+            get(
+                |axum::Extension(Client(client)): axum::Extension<Client>| async move {
+                    client.to_string()
+                },
+            ),
+        );
+        let _running = Running(tokio::spawn(serve_http(
+            listener,
+            app,
+            stopped,
+            Limits::default(),
+        )));
+        let ask = |forwarded: &'static str| async move {
+            timeout(Duration::from_secs(5), async {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(
+                        format!("GET /client HTTP/1.1\r\nHost: example.org\r\n{forwarded}Connection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).await.unwrap();
+                response.rsplit("\r\n").next().unwrap().to_owned()
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(ask("").await, "127.0.0.1");
+        assert_eq!(ask("X-Forwarded-For: 192.0.2.7\r\n").await, "192.0.2.7");
+        assert_eq!(ask("X-Forwarded-For: garbage\r\n").await, "127.0.0.1");
     }
 
     #[tokio::test]

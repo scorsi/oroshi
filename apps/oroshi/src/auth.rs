@@ -110,19 +110,22 @@ pub async fn require_scope(
         .map(|secret| tokens.authorize(&secret))
         .unwrap_or((StatusCode::UNAUTHORIZED, "unknown"));
     if status != StatusCode::OK {
+        let client = crate::server::Client::field(&request);
         tokens.registry.auth_refusals(tokens.module).add(1);
         // A request without credentials is routine (clients wait for the challenge): info, not warn.
         if request.headers().contains_key(header::AUTHORIZATION) {
             tracing::warn!(
                 event = "auth-refused",
                 module = tokens.module.label(),
-                token = name
+                token = name,
+                client
             );
         } else {
             tracing::info!(
                 event = "auth-refused",
                 module = tokens.module.label(),
-                token = name
+                token = name,
+                client
             );
         }
     }

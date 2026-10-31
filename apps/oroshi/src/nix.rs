@@ -204,6 +204,7 @@ async fn observe_upload(
     } else {
         "other"
     };
+    let client = crate::server::Client::field(&request);
     let mut response = next.run(request).await;
     if let Some(committed) = response.extensions().get::<UploadCommitted>() {
         registry
@@ -226,7 +227,13 @@ async fn observe_upload(
         if response.extensions().get::<UploadRefused>().is_none() {
             response = UploadError(response.status(), reason).into_response();
         }
-        tracing::warn!(event = "upload-refused", module = "nix", kind, reason);
+        tracing::warn!(
+            event = "upload-refused",
+            module = "nix",
+            kind,
+            reason,
+            client
+        );
     }
     response
 }

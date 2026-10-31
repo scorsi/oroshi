@@ -382,3 +382,35 @@ async fn request_event_keeps_http_status_an_integer() {
     assert_eq!(line["event"], "request");
     assert_eq!(line["status"].as_u64(), Some(200));
 }
+
+#[tokio::test]
+async fn request_and_refusal_lines_record_the_client() {
+    let (_root, store, _) = fixture();
+    let app = app(store, Arc::new(Registry::new()), &config());
+    let cases = [
+        ("/nix/x.narinfo", None, "auth-refused"),
+        ("/nix/bad.narinfo", Some("secret"), "upload-refused"),
+        ("/nix/nar/missing.nar", Some("secret"), "request"),
+    ];
+    for (path, credential, event) in cases {
+        let method = if event == "request" { "GET" } else { "PUT" };
+        let mut request = Request::builder().method(method).uri(path);
+        if let Some(credential) = credential {
+            request = request.header(header::AUTHORIZATION, credential);
+        }
+        let mut request = request.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(Client("2001:db8::7".parse().unwrap()));
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(bytes.clone()));
+        super::upload_tests::send(app.clone(), request)
+            .with_subscriber(subscriber)
+            .await;
+        let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let line: Value = serde_json::from_str(text.lines().next().expect(event)).unwrap();
+        assert!(schema::valid(text.lines().next().unwrap()), "{text}");
+        assert_eq!(line["event"], event, "{text}");
+        assert_eq!(line["client"], "2001:db8::7", "{text}");
+    }
+}

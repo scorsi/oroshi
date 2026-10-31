@@ -230,7 +230,10 @@ with a different NAR. There is no `--dry-run`.
 
 Upload responses use the closed plain-text reasons in
 [`apps/oroshi/src/nix.rs`](../apps/oroshi/src/nix.rs), logged as `upload-refused`;
-authentication failures are logged as `auth-refused`.
+authentication failures are logged as `auth-refused`. These lines and `request`
+carry `client`: the address in `X-Forwarded-For` (its rightmost entry) when the
+connection comes from a loopback address, as from the local reverse proxy, and the
+connecting address otherwise (ADR 0029).
 
 | HTTP | Reason | Meaning |
 | --- | --- | --- |

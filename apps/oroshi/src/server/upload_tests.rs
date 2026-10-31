@@ -61,7 +61,7 @@ pub(super) async fn request(
     send(app, request.body(body).unwrap()).await
 }
 
-async fn send(
+pub(super) async fn send(
     mut app: impl axum::ServiceExt<Request, Response = Response, Error = Infallible>,
     request: Request,
 ) -> Response {
