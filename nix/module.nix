@@ -51,6 +51,57 @@ let
   isLoopback =
     address:
     builtins.match "(127\\.[0-9]+\\.[0-9]+\\.[0-9]+|\\[(0*:)*:?(0*:)*0*1]):[0-9]+" address != null;
+  hardening = {
+    User = "oroshi";
+    Group = "oroshi";
+    StateDirectory = lib.mkIf (stateDir == "/var/lib/oroshi") "oroshi";
+    StateDirectoryMode = "0750";
+    ReadWritePaths = [ stateDir ];
+    ProtectSystem = "strict";
+    PrivateTmp = true;
+    NoNewPrivileges = true;
+    CapabilityBoundingSet = "";
+    RestrictAddressFamilies = [
+      "AF_UNIX"
+      "AF_INET"
+      "AF_INET6"
+    ];
+    UMask = "0027";
+    ProtectHome = true;
+    PrivateDevices = true;
+    PrivateUsers = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectControlGroups = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectProc = "invisible";
+    ProcSubset = "pid";
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    MemoryDenyWriteExecute = true;
+    RemoveIPC = true;
+    SystemCallFilter = [
+      "@system-service"
+      "~@privileged"
+      "~@resources"
+    ];
+    SystemCallArchitectures = "native";
+    # Only the co-located proxy and the loopback metrics scraper may connect.
+    IPAddressAllow = "localhost";
+    IPAddressDeny = "any";
+    # Above the 1024 connections oroshi accepts, each with a blob and a SQLite reader.
+    LimitNOFILE = 8192;
+    # Tokio's blocking pool tops out at 512 threads.
+    TasksMax = 1024;
+    # A core dump could hold a presented token.
+    LimitCORE = 0;
+    LogRateLimitIntervalSec = lib.mkDefault "30s";
+    LogRateLimitBurst = lib.mkDefault 30000;
+  };
   configFile =
     let
       raw = toml.generate "oroshi.toml" settings;
@@ -111,10 +162,10 @@ in
         type = types.nullOr types.ints.unsigned;
         default = null;
         description = ''
-          Maximum stored blob bytes. Required until garbage collection ships: without a
-          collector an uncapped store only grows. A logical cap on registered blob bytes;
-          it does not count filesystem overhead, inodes, SQLite or orphans, so the
-          deployment also sets a filesystem quota.
+          Maximum stored blob bytes; null leaves the store bounded by retention alone, with
+          no size-cap pass. A logical cap on registered blob bytes; it does not count
+          filesystem overhead, inodes, SQLite or orphans, so the deployment also sets a
+          filesystem quota.
         '';
       };
       gcTargetRatio = mkOption {
@@ -122,6 +173,11 @@ in
         default = 0.9;
         description = "Target fraction of the storage capacity after garbage collection.";
       };
+    };
+    gc.schedule = mkOption {
+      type = types.str;
+      default = "daily";
+      description = "systemd OnCalendar expression for oroshi-gc.timer; module-only.";
     };
     gc.orphanGrace = mkOption {
       type = types.ints.unsigned;
@@ -187,10 +243,6 @@ in
         message = "services.oroshi.listen must be a loopback socket address.";
       }
       {
-        assertion = (settings.storage.max_bytes or null) != null;
-        message = "services.oroshi.storage.maxBytes must be set: oroshi has no garbage collector yet, so an uncapped store can fill the disk.";
-      }
-      {
         assertion = lib.hasPrefix "/" stateDir;
         message = "services.oroshi.stateDir must be an absolute path.";
       }
@@ -206,59 +258,26 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       restartTriggers = [ configFile ];
-      serviceConfig = {
+      serviceConfig = hardening // {
         Type = "notify";
         ExecStart = "${lib.getExe cfg.package} serve --config ${configFile}";
         Restart = "on-failure";
-        User = "oroshi";
-        Group = "oroshi";
-        StateDirectory = lib.mkIf (stateDir == "/var/lib/oroshi") "oroshi";
-        StateDirectoryMode = "0750";
-        ReadWritePaths = [ stateDir ];
-        ProtectSystem = "strict";
-        PrivateTmp = true;
-        NoNewPrivileges = true;
-        CapabilityBoundingSet = "";
-        RestrictAddressFamilies = [
-          "AF_UNIX"
-          "AF_INET"
-          "AF_INET6"
-        ];
-        UMask = "0027";
-        ProtectHome = true;
-        PrivateDevices = true;
-        PrivateUsers = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectKernelLogs = true;
-        ProtectControlGroups = true;
-        ProtectClock = true;
-        ProtectHostname = true;
-        ProtectProc = "invisible";
-        ProcSubset = "pid";
-        RestrictNamespaces = true;
-        RestrictRealtime = true;
-        RestrictSUIDSGID = true;
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
-        RemoveIPC = true;
-        SystemCallFilter = [
-          "@system-service"
-          "~@privileged"
-          "~@resources"
-        ];
-        SystemCallArchitectures = "native";
-        # Only the co-located proxy and the loopback metrics scraper may connect.
-        IPAddressAllow = "localhost";
-        IPAddressDeny = "any";
-        # Above the 1024 connections oroshi accepts, each with a blob and a SQLite reader.
-        LimitNOFILE = 8192;
-        # Tokio's blocking pool tops out at 512 threads.
-        TasksMax = 1024;
-        # A core dump could hold a presented token.
-        LimitCORE = 0;
-        LogRateLimitIntervalSec = lib.mkDefault "30s";
-        LogRateLimitBurst = lib.mkDefault 30000;
+      };
+    };
+    # Same user and sandbox as the server; it takes gc.lock, never oroshi.lock (ADR 0005).
+    systemd.services.oroshi-gc = {
+      description = "oroshi garbage collection";
+      after = [ "oroshi.service" ];
+      serviceConfig = hardening // {
+        Type = "oneshot";
+        ExecStart = "${lib.getExe cfg.package} gc --config ${configFile}";
+      };
+    };
+    systemd.timers.oroshi-gc = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.gc.schedule;
+        Persistent = true;
       };
     };
   };

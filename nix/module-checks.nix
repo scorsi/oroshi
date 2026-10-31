@@ -31,7 +31,10 @@ let
               maxBytes = 2048;
               gcTargetRatio = 0.8;
             };
-            gc.orphanGrace = 7200;
+            gc = {
+              schedule = "*-*-* 03:00:00";
+              orphanGrace = 7200;
+            };
             retention.days = 7;
             tokens.builder = {
               sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -56,6 +59,12 @@ let
     };
   evaluated = (evaluate false { }).config;
   unit = evaluated.systemd.services.oroshi;
+  gcUnit = evaluated.systemd.services.oroshi-gc;
+  withoutRole = lib.flip builtins.removeAttrs [
+    "Type"
+    "ExecStart"
+    "Restart"
+  ];
   configFile = extra: (evaluate true extra).config.environment.etc."oroshi/oroshi.toml".source;
   assertionsPass = extra: lib.all (a: a.assertion) (evaluate false extra).config.assertions;
   defaultOptions = {
@@ -71,7 +80,10 @@ let
         maxBytes = lib.mkForce null;
         gcTargetRatio = lib.mkForce 0.9;
       };
-      gc.orphanGrace = lib.mkForce 3600;
+      gc = {
+        schedule = lib.mkForce "daily";
+        orphanGrace = lib.mkForce 3600;
+      };
       retention.days = lib.mkForce 30;
       tokens = lib.mkForce { };
       nix = {
@@ -120,7 +132,22 @@ in
     assert !(assertionsPass { services.oroshi.listen = lib.mkForce "0.0.0.0:8080"; });
     assert !(assertionsPass { services.oroshi.settings.server.listen = "192.0.2.1:8080"; });
     assert assertionsPass { services.oroshi.listen = lib.mkForce "[::1]:8080"; };
-    assert !(assertionsPass { services.oroshi.storage.maxBytes = lib.mkForce null; });
+    # ADR 0027: maxBytes is optional.
+    assert assertionsPass { services.oroshi.storage.maxBytes = lib.mkForce null; };
+    assert gcUnit.serviceConfig.Type == "oneshot";
+    assert
+      gcUnit.serviceConfig.ExecStart == "${lib.getExe evaluated.services.oroshi.package} gc --config ${
+        evaluated.environment.etc."oroshi/oroshi.toml".source
+      }";
+    assert withoutRole gcUnit.serviceConfig == withoutRole unit.serviceConfig;
+    assert gcUnit.after == [ "oroshi.service" ] && gcUnit.wantedBy == [ ];
+    assert evaluated.systemd.timers.oroshi-gc.wantedBy == [ "timers.target" ];
+    assert
+      evaluated.systemd.timers.oroshi-gc.timerConfig == {
+        OnCalendar = "*-*-* 03:00:00";
+        Persistent = true;
+      };
+    assert defaults.systemd.timers.oroshi-gc.timerConfig.OnCalendar == "daily";
     assert assertionsPass {
       services.oroshi.storage.maxBytes = lib.mkForce null;
       services.oroshi.settings.storage.max_bytes = 4096;
