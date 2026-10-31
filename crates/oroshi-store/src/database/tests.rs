@@ -832,3 +832,103 @@ fn merges_keep_only_trusted_signatures_and_refuse_oversized_results() {
     ));
     assert_eq!(content(&database), before);
 }
+
+#[test]
+fn a_commit_from_another_handle_between_read_and_write_does_not_fail_the_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    let server = Database::open(root.path()).unwrap().0;
+    let gc = Database::open_existing(root.path()).unwrap();
+    let count = |connection: &Connection| -> i64 {
+        connection
+            .query_row("SELECT count(*) FROM blob", [], |row| row.get(0))
+            .unwrap()
+    };
+    let insert = |connection: &Connection, byte: u8| {
+        connection
+            .execute(
+                "INSERT INTO blob VALUES (?1, 1, 0)",
+                [[byte; 32].as_slice()],
+            )
+            .map(drop)
+    };
+
+    // Counterfactual: a deferred read-then-write transaction fails once another handle commits.
+    let mut writer = server.writer().unwrap();
+    let deferred = writer
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .unwrap();
+    assert_eq!(count(&deferred), 0);
+    insert(&gc.writer().unwrap(), 1).unwrap();
+    let error = insert(&deferred, 2).unwrap_err();
+    assert_eq!(
+        error.sqlite_error().map(|error| error.extended_code),
+        Some(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT)
+    );
+    drop(deferred);
+
+    // The default transaction holds the write lock from its start: the other handle's
+    // commit waits on the busy timeout and lands after it, and both succeed.
+    let transaction = writer.transaction().unwrap();
+    assert_eq!(count(&transaction), 1);
+    let other = std::thread::scope(|scope| {
+        let other = scope.spawn(|| insert(&gc.writer().unwrap(), 3));
+        std::thread::sleep(Duration::from_millis(200));
+        insert(&transaction, 2).unwrap();
+        transaction.commit().unwrap();
+        other.join().unwrap()
+    });
+    other.unwrap();
+    assert_eq!(count(&writer), 3);
+}
+
+#[test]
+fn register_nar_waits_for_a_write_transaction_of_another_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let server = Database::open(root.path()).unwrap().0;
+    let gc = Database::open_existing(root.path()).unwrap();
+    let mut writer = gc.writer().unwrap();
+    let transaction = writer.transaction().unwrap();
+    std::thread::scope(|scope| {
+        let upload = scope.spawn(|| {
+            server.register_nar(
+                "nar/example.nar.zst",
+                &Blob {
+                    hash: [7; 32],
+                    size: 9,
+                },
+                1,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        transaction
+            .execute("INSERT INTO blob VALUES (zeroblob(32), 1, 0)", [])
+            .unwrap();
+        transaction.commit().unwrap();
+        upload.join().unwrap().unwrap();
+    });
+    assert!(server.nar_blob("nar/example.nar.zst").unwrap().is_some());
+}
+
+#[test]
+fn existing_open_refuses_other_schema_versions_without_migrating() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        Database::open_existing(root.path()),
+        Err(DatabaseError::Sqlite(_))
+    ));
+    assert!(!root.path().join("db").exists());
+    drop(Database::open(root.path()).unwrap());
+    let path = root.path().join("db/oroshi.sqlite");
+    for found in [MIGRATIONS.len() as i64 - 1, MIGRATIONS.len() as i64 + 1] {
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", found)
+            .unwrap();
+        assert!(matches!(
+            Database::open_existing(root.path()),
+            Err(DatabaseError::SchemaMismatch { found: actual, expected })
+                if actual == found && expected == MIGRATIONS.len()
+        ));
+        assert_eq!(version(&Connection::open(&path).unwrap()), found);
+    }
+}

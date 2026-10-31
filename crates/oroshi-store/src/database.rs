@@ -4,9 +4,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use oroshi_nix::{MAX_NARINFO_BYTES, NarInfo, ParseError, PublicKey, parse_store_path};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::Blob;
 
@@ -16,6 +17,8 @@ const MIGRATIONS: &[&str] = &[
     "CREATE INDEX narinfo_nar_url ON narinfo (nar_url);
      CREATE INDEX reference_reference ON reference (reference);",
 ];
+/// How long a write waits for another process's write lock (server and `oroshi gc`).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Idle read-only connections kept for reuse; extra concurrent readers are closed after use.
 const POOLED_READERS: usize = 16;
 
@@ -25,6 +28,7 @@ pub enum DatabaseError {
     Sqlite(rusqlite::Error),
     InvalidStorePath(ParseError),
     UnsupportedSchema { found: i64, supported: usize },
+    SchemaMismatch { found: i64, expected: usize },
     WriterPoisoned,
     NarinfoConflict,
     MissingReference,
@@ -44,6 +48,10 @@ impl fmt::Display for DatabaseError {
             Self::UnsupportedSchema { found, supported } => write!(
                 f,
                 "unsupported database schema version {found}; binary supports versions 0..={supported}"
+            ),
+            Self::SchemaMismatch { found, expected } => write!(
+                f,
+                "database schema version {found} differs from this binary's {expected}"
             ),
             Self::NarinfoConflict => f.write_str("conflicting narinfo metadata"),
             Self::MissingReference => f.write_str("missing narinfo reference"),
@@ -138,16 +146,39 @@ impl Database {
         if mode != "wal" {
             return Err(io::Error::other("SQLite did not enable WAL mode").into());
         }
-        writer.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
+        configure_writer(&mut writer)?;
         let applied = migrate(&mut writer, MIGRATIONS)?;
-        Ok((
-            Self {
-                path,
-                writer: Mutex::new(writer),
-                readers: Mutex::default(),
-            },
-            applied,
-        ))
+        Ok((Self::new(path, writer), applied))
+    }
+
+    /// Open the database of a running server from a second process (`oroshi gc`): never
+    /// creates or migrates it and refuses any schema version but this binary's (ADR 0013).
+    /// Such a process must not call `BlobStore::open`: its temp sweep deletes in-flight uploads.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        let path = root.as_ref().join("db/oroshi.sqlite");
+        let flags = OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE);
+        let mut writer = Connection::open_with_flags(&path, flags)?;
+        let found: i64 = writer.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found != MIGRATIONS.len() as i64 {
+            return Err(DatabaseError::SchemaMismatch {
+                found,
+                expected: MIGRATIONS.len(),
+            });
+        }
+        let mode: String = writer.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if mode != "wal" {
+            return Err(io::Error::other("database is not in WAL mode").into());
+        }
+        configure_writer(&mut writer)?;
+        Ok(Self::new(path, writer))
+    }
+
+    fn new(path: PathBuf, writer: Connection) -> Self {
+        Self {
+            path,
+            writer: Mutex::new(writer),
+            readers: Mutex::default(),
+        }
     }
 
     /// Total bytes of registered blobs, counting each content hash once.
@@ -362,6 +393,16 @@ impl Database {
             connection: Some(connection),
         })
     }
+}
+
+fn configure_writer(writer: &mut Connection) -> Result<(), DatabaseError> {
+    writer.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
+    writer.busy_timeout(BUSY_TIMEOUT)?;
+    // A deferred transaction that reads before writing fails with SQLITE_BUSY_SNAPSHOT,
+    // without waiting, when another process committed in between; IMMEDIATE takes the
+    // write lock first. Single-statement autocommit writes (access updates) already do.
+    writer.set_transaction_behavior(TransactionBehavior::Immediate);
+    Ok(())
 }
 
 fn check_version(connection: &Connection, supported: usize) -> Result<usize, DatabaseError> {
