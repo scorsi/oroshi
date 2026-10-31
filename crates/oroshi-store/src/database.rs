@@ -16,6 +16,25 @@ const MIGRATIONS: &[&str] = &[
     // Anonymous NAR reads update by nar_url under the writer lock; GC deletes check references.
     "CREATE INDEX narinfo_nar_url ON narinfo (nar_url);
      CREATE INDEX reference_reference ON reference (reference);",
+    // GC (ADR 0005, 0023, 0024). Existing NAR rows start their grace at the migration.
+    "ALTER TABLE nar ADD COLUMN registered_at INTEGER NOT NULL DEFAULT 0;
+     UPDATE nar SET registered_at = CAST(strftime('%s', 'now') AS INTEGER);
+     CREATE TABLE root (
+         name TEXT NOT NULL CHECK (
+             length(name) BETWEEN 1 AND 64 AND name NOT GLOB '*[^A-Za-z0-9._-]*'
+         ),
+         store_path TEXT NOT NULL REFERENCES narinfo(store_path),
+         PRIMARY KEY (name, store_path)
+     );
+     CREATE INDEX root_store_path ON root (store_path);
+     CREATE TABLE gc_state (
+         id INTEGER PRIMARY KEY CHECK (id = 1),
+         runs_success INTEGER NOT NULL DEFAULT 0,
+         runs_error INTEGER NOT NULL DEFAULT 0,
+         freed_bytes INTEGER NOT NULL DEFAULT 0,
+         last_success_at INTEGER
+     );
+     INSERT INTO gc_state (id) VALUES (1);",
 ];
 /// How long a write waits for another process's write lock (server and `oroshi gc`).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -202,25 +221,21 @@ impl Database {
             .optional()?)
     }
 
-    /// Register a published blob and its NAR URL atomically; duplicates are no-ops.
-    /// Call only after the blob's hash has been verified against its URL.
-    pub fn register_nar(
-        &self,
-        url: &str,
-        blob: &Blob,
-        created_at: i64,
-    ) -> Result<(), DatabaseError> {
+    /// Register a published blob and its NAR URL atomically; a duplicate only refreshes
+    /// the NAR row's `registered_at`, the GC grace clock of a NAR no narinfo uses (0024).
+    /// Call only after the blob's hash has been verified against its URL. `now` is Unix time.
+    pub fn register_nar(&self, url: &str, blob: &Blob, now: i64) -> Result<(), DatabaseError> {
         let mut writer = self.writer()?;
         let transaction = writer.transaction()?;
         transaction.execute(
             "INSERT INTO blob (sha256, size, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (sha256) DO NOTHING",
-            rusqlite::params![blob.hash.as_slice(), blob.size, created_at],
+            rusqlite::params![blob.hash.as_slice(), blob.size, now],
         )?;
         transaction.execute(
-            "INSERT INTO nar (url, blob_sha256) VALUES (?1, ?2)
-             ON CONFLICT (url) DO NOTHING",
-            rusqlite::params![url, blob.hash.as_slice()],
+            "INSERT INTO nar (url, blob_sha256, registered_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (url) DO UPDATE SET registered_at = excluded.registered_at",
+            rusqlite::params![url, blob.hash.as_slice(), now],
         )?;
         transaction.commit()?;
         Ok(())

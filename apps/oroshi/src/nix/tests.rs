@@ -32,7 +32,7 @@ pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Store>, Vec<u8>, NarInfo) {
             .unwrap();
         writer
             .execute(
-                "INSERT INTO nar VALUES (?1, ?2)",
+                "INSERT INTO nar (url, blob_sha256) VALUES (?1, ?2)",
                 (&info.url, &blob.hash[..]),
             )
             .unwrap();
@@ -258,7 +258,7 @@ async fn all_protocol_nar_suffixes_are_readable() {
             .writer()
             .unwrap()
             .execute(
-                "INSERT INTO nar SELECT ?1, blob_sha256 FROM nar WHERE url = ?2",
+                "INSERT INTO nar (url, blob_sha256) SELECT ?1, blob_sha256 FROM nar WHERE url = ?2",
                 (&url, &info.url),
             )
             .unwrap();

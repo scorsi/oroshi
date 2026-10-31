@@ -270,7 +270,7 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
             .collect();
         if signal == "-TERM" {
             let versions: Vec<_> = migrations.iter().map(|line| &line["version"]).collect();
-            assert_eq!(versions, [1, 2]);
+            assert_eq!(versions, [1, 2, 3]);
         } else {
             assert!(migrations.is_empty());
         }

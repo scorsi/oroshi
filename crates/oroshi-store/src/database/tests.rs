@@ -10,7 +10,7 @@ fn seed(connection: &Connection) {
     connection
         .execute_batch(
             "INSERT INTO blob VALUES (zeroblob(32), 123, 1000);
-             INSERT INTO nar VALUES ('nar/example.nar.zst', zeroblob(32));
+             INSERT INTO nar (url, blob_sha256) VALUES ('nar/example.nar.zst', zeroblob(32));
              INSERT INTO narinfo VALUES (
                  '/nix/store/00000000000000000000000000000000-example',
                  '00000000000000000000000000000000',
@@ -35,7 +35,10 @@ fn empty_database_creates_the_schema_in_the_specified_layout() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(tables, ["blob", "nar", "narinfo", "reference"]);
+    assert_eq!(
+        tables,
+        ["blob", "gc_state", "nar", "narinfo", "reference", "root"]
+    );
     seed(&writer);
     let source: String = writer
         .query_row("SELECT source FROM narinfo", [], |row| row.get(0))
@@ -214,8 +217,8 @@ fn schema_enforces_keys_sizes_and_foreign_keys() {
         "INSERT INTO blob VALUES (randomblob(32), 1.5, 0)",
         "INSERT INTO blob VALUES (randomblob(32), 'invalid', 0)",
         "INSERT INTO blob VALUES (NULL, 1, 0)",
-        "INSERT INTO nar VALUES ('nar/missing.nar', randomblob(32))",
-        "INSERT INTO nar VALUES ('nar/example.nar.zst', zeroblob(32))",
+        "INSERT INTO nar (url, blob_sha256) VALUES ('nar/missing.nar', randomblob(32))",
+        "INSERT INTO nar (url, blob_sha256) VALUES ('nar/example.nar.zst', zeroblob(32))",
         "UPDATE narinfo SET nar_url = 'nar/missing.nar'",
         "UPDATE narinfo SET source = NULL",
         "UPDATE narinfo SET store_hash = 'short'",
@@ -931,4 +934,139 @@ fn existing_open_refuses_other_schema_versions_without_migrating() {
         ));
         assert_eq!(version(&Connection::open(&path).unwrap()), found);
     }
+}
+
+#[test]
+fn version_two_databases_gain_the_gc_schema_and_keep_their_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let before = {
+        let directory = root.path().join("db");
+        fs::create_dir_all(&directory).unwrap();
+        let mut connection = Connection::open(directory.join("oroshi.sqlite")).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
+        seed(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO reference VALUES (
+                    '/nix/store/00000000000000000000000000000000-example',
+                    '/nix/store/00000000000000000000000000000000-example'
+                 );",
+            )
+            .unwrap();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    for restart in [false, true] {
+        let (database, applied) = Database::open(root.path()).unwrap();
+        assert_eq!(applied.is_empty(), restart);
+        let reader = database.reader().unwrap();
+        let (content, registered_at, edges, state): (
+            String,
+            i64,
+            i64,
+            (i64, i64, i64, Option<i64>),
+        ) = reader
+            .query_row(
+                "SELECT content, registered_at, (SELECT count(*) FROM reference),
+                         runs_success, runs_error, freed_bytes, last_success_at
+                     FROM narinfo JOIN nar ON nar.url = narinfo.nar_url, gc_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(content, "narinfo content");
+        assert!(registered_at >= before, "grace starts at the migration");
+        assert_eq!(edges, 1);
+        assert_eq!(state, (0, 0, 0, None));
+    }
+}
+
+#[test]
+fn gc_schema_keeps_rooted_and_referenced_narinfos_and_one_state_row() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap().0;
+    let info = libiconv();
+    register_nar(&database, &info);
+    database.commit_narinfo(&info, &[], "upload", 2000).unwrap();
+    let writer = database.writer().unwrap();
+    let path = &info.store_path;
+    writer
+        .execute("INSERT INTO root VALUES ('release-1.0_a', ?1)", [path])
+        .unwrap();
+    for (sql, parameter) in [
+        ("DELETE FROM reference WHERE referrer = ?1", Some(path)),
+        ("DELETE FROM narinfo WHERE store_path = ?1", Some(path)),
+        ("INSERT INTO root VALUES ('', ?1)", Some(path)),
+        ("INSERT INTO root VALUES ('bad/name', ?1)", Some(path)),
+        ("INSERT INTO root VALUES ('x', '/nix/store/missing')", None),
+        ("INSERT INTO gc_state (id) VALUES (2)", None),
+        ("INSERT INTO gc_state (id) VALUES (1)", None),
+    ] {
+        let result = match parameter {
+            Some(parameter) => writer.execute(sql, [parameter]),
+            None => writer.execute(sql, []),
+        };
+        // Only the edge delete is allowed: libiconv's self-edge is not a foreign key target.
+        if sql.starts_with("DELETE FROM reference") {
+            result.unwrap();
+            continue;
+        }
+        assert_eq!(
+            result.expect_err(sql).sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation),
+            "{sql}"
+        );
+    }
+    writer.execute("DELETE FROM root", []).unwrap();
+    drop(writer);
+
+    // Unrooted and without its self-edge, a narinfo still referenced by another cannot go.
+    let dependent = hello();
+    register_nar(&database, &dependent);
+    database
+        .commit_narinfo(&dependent, &[], "upload", 2000)
+        .unwrap();
+    assert_eq!(
+        database
+            .writer()
+            .unwrap()
+            .execute("DELETE FROM narinfo WHERE store_path = ?1", [path])
+            .unwrap_err()
+            .sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ConstraintViolation)
+    );
+}
+
+#[test]
+fn every_nar_upload_refreshes_its_registration_time_only() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap().0;
+    let blob = Blob {
+        hash: [3; 32],
+        size: 5,
+    };
+    let times = || -> (i64, i64) {
+        database
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT created_at, registered_at FROM nar JOIN blob ON blob.sha256 = blob_sha256",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    database.register_nar("nar/a.nar", &blob, 100).unwrap();
+    assert_eq!(times(), (100, 100));
+    database.register_nar("nar/a.nar", &blob, 500).unwrap();
+    assert_eq!(times(), (100, 500));
 }
