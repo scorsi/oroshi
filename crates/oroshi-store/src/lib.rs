@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod database;
+pub mod gc;
 
 pub use database::{Database, DatabaseError, Reader};
 
