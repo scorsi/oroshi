@@ -117,6 +117,11 @@
               self = inputs.self;
               inherit (inputs) nisshi masu;
             };
+            gc = import ./nix/test-gc.nix {
+              inherit pkgs system;
+              self = inputs.self;
+              inherit (inputs) nisshi masu;
+            };
             service = import ./nix/test-service.nix {
               inherit pkgs system;
               self = inputs.self;
