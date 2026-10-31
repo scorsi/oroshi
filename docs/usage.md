@@ -1,7 +1,9 @@
 # Using the Nix cache
 
-These examples follow [the stock-client test](../nix/test-nix-cache.nix) and
-[the TLS boundary test](../nix/test-tls-boundary.nix) (ADRs
+These examples follow [the stock-client test](../nix/test-nix-cache.nix),
+[the TLS boundary test](../nix/test-tls-boundary.nix) and
+[the garbage collection test](../nix/test-gc.nix) (ADRs
+[0005](adr/0005-retention-and-gc.md),
 [0006](adr/0006-nix-binary-cache.md), [0007](adr/0007-nix-signing-and-trust.md),
 [0008](adr/0008-authentication.md), [0010](adr/0010-http-exposure.md),
 [0014](adr/0014-deployment-requirements.md)). Replace angle-bracket placeholders;
@@ -124,9 +126,105 @@ half the orphan grace, and a 60-second idle timeout on upload bodies and on
 responses a client stops reading. Clients must never access the
 plain HTTP backend directly. The service also requires one serving instance per
 state directory on a durable local filesystem with atomic rename, file/directory
-fsync and SQLite WAL locking; leave disk headroom beyond `storage.maxBytes`, which
-the NixOS module requires until garbage collection ships. It is a logical cap on
-blob bytes: bound the filesystem with a quota as well.
+fsync and SQLite WAL locking; leave disk headroom beyond `storage.maxBytes`, when
+set. It is a logical cap on blob bytes: bound the filesystem with a quota as well.
+
+## Retention and garbage collection
+
+`oroshi gc` deletes what is no longer kept; uploads and reads continue while it runs.
+
+- **Expiry**: a path not read or uploaded for `retention.days` (default 30) expires,
+  unless a named root holds it or a path that is still kept references it. Reads
+  refresh a path's access time at most once per hour.
+- **Size cap**: with `storage.maxBytes` set, when registered blob bytes stay above
+  `storage.gcTargetRatio` (default 0.9) of it after expiry, gc also removes the least
+  recently accessed paths outside every root's closure, never one that a remaining
+  path references, until it reaches the target. Without `storage.maxBytes` only
+  expiry bounds the cache.
+- **Sweep**: NARs and blobs no path uses, files under `blobs/` without a row and
+  temporary files are removed once older than `gc.orphanGrace` (default 3600 s),
+  so in-flight uploads are never touched.
+
+```nix
+services.oroshi = {
+  retention.days = 30;
+  storage = {
+    maxBytes = 500 * 1024 * 1024 * 1024;
+    gcTargetRatio = 0.9;
+  };
+  gc = {
+    schedule = "daily"; # systemd OnCalendar, used by oroshi-gc.timer
+    orphanGrace = 3600;
+  };
+};
+```
+
+The module installs `oroshi-gc.timer` (`Persistent=true`: a run missed while the
+machine was off happens at the next boot) and `oroshi-gc.service`, a oneshot running
+`oroshi gc --config <path>` as the `oroshi` user with the server's sandbox. Run it now
+with:
+
+```sh
+systemctl start oroshi-gc.service
+```
+
+Each run takes `gc.lock` in the state directory (a second concurrent run is refused),
+writes one `gc-run{deleted_entries,deleted_blobs,freed_bytes,dur_us}` line (at
+`error` with `err` on failure) and exits non-zero on failure. The server exposes
+`oroshi_gc_runs_total{result}`, `oroshi_gc_freed_bytes_total` and
+`oroshi_gc_last_success_timestamp_seconds` (0 before any successful run); alert
+when the last success grows older than the schedule.
+
+## Pin paths with named roots
+
+A root keeps the closures of its store paths forever, whatever their access time
+or the size cap. Give the release automation a token with `nix:pin` (add
+`"nix:write"` too if it also uploads):
+
+```nix
+services.oroshi.tokens.release = {
+  sha256 = "<64-lowercase-hex-digits-from-oroshi-token-hash>";
+  scopes = [ "nix:pin" ];
+};
+```
+
+`PUT` replaces the root with the store paths of the body, one per line; every path
+must already be in the cache. `DELETE` removes the root; its paths then expire
+normally. Names match `[A-Za-z0-9._-]{1,64}`.
+
+```sh
+printf '%s\n' /nix/store/<hash>-<name> /nix/store/<hash>-<other> |
+  curl -fsS -X PUT -H "Authorization: Bearer $(cat /run/secrets/oroshi-pin-token)" \
+    --data-binary @- https://oroshi.example.org/nix/_oroshi/roots/release
+curl -fsS -X DELETE -H "Authorization: Bearer $(cat /run/secrets/oroshi-pin-token)" \
+  https://oroshi.example.org/nix/_oroshi/roots/release
+```
+
+Both answer 204; a `DELETE` of an unknown root answers 404. A malformed name or
+line is refused with 400 `bad-name`, an absent path with 400 `missing-reference`,
+an empty list with 400 `invalid-body` and a body above 1 MiB with 413 `too-large`;
+a token without `nix:pin` gets 403. Changes are logged as `root-set{name,paths}`
+and `root-deleted{name}`. Roots cannot be read back: the automation that sets them
+already knows their content.
+
+## Drop a poisoned narinfo
+
+To remove a path that must not be served (for example a broken build signed by a
+trusted key), run on the cache, as the `oroshi` user, against the module's
+configuration:
+
+```sh
+sudo -u oroshi <oroshi-package>/bin/oroshi nix drop --config /etc/oroshi/oroshi.toml \
+  /nix/store/<hash>-<name>
+```
+
+The narinfo and its references are deleted at once; its NAR and blob are left to
+the next gc sweep. The drop is refused when another path references it or a root
+holds it; `--with-referrers` also drops every path that references it, directly or
+not, and is still refused, dropping nothing, if any of them is rooted. An absent
+path is refused. Refusals exit non-zero with a `fatal` line; success logs
+`narinfo-dropped{name,referrers}`. A dropped path can then be uploaded again,
+with a different NAR. There is no `--dry-run`.
 
 ## Refusals
 
