@@ -652,3 +652,50 @@ mod sweep {
         assert_eq!(start.len() + rest.len(), content.len());
     }
 }
+
+mod roots {
+    use crate::database::tests::{hello, libiconv, register_nar, stored_paths};
+    use crate::{BlobStore, Database, DatabaseError};
+
+    use super::*;
+
+    #[test]
+    fn a_rooted_closure_survives_expiry_and_the_cap_pass_while_the_rest_goes() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(root.path()).unwrap();
+        let database = Database::open(root.path()).unwrap().0;
+        let mut other = libiconv();
+        other.store_path = "/nix/store/00000000000000000000000000000000-other".into();
+        other.url = "nar/other.nar".into();
+        other.file_hash = Some([9; 32]);
+        other.references.clear();
+        for info in [libiconv(), hello(), other.clone()] {
+            register_nar(&database, &info);
+            database.commit_narinfo(&info, &[], "upload", 1).unwrap();
+        }
+        let absent = ["/nix/store/11111111111111111111111111111111-absent".to_owned()];
+        assert!(matches!(
+            database.set_root("release", &absent.into()),
+            Err(DatabaseError::MissingReference)
+        ));
+        database
+            .set_root("release", &[hello().store_path].into())
+            .unwrap();
+        // Everything is expired and a zero cap wants every byte back.
+        let mut policy = policy(Some(0));
+        policy.now = 1 + policy.retention;
+        let mut report = Report::default();
+        database.collect(&blobs, &policy, &mut report).unwrap();
+        assert_eq!(report.deleted_entries, 1);
+        let mut kept = vec![hello().store_path, libiconv().store_path];
+        kept.sort();
+        assert_eq!(stored_paths(&database), kept);
+
+        assert!(database.delete_root("release").unwrap());
+        assert!(!database.delete_root("release").unwrap());
+        let mut report = Report::default();
+        database.collect(&blobs, &policy, &mut report).unwrap();
+        assert_eq!(report.deleted_entries, 2);
+        assert!(stored_paths(&database).is_empty());
+    }
+}

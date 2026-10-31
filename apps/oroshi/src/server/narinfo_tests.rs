@@ -16,7 +16,7 @@ fn path(info: &NarInfo) -> String {
     )
 }
 
-async fn put(app: Router, info: &NarInfo) -> Response {
+pub(super) async fn put(app: Router, info: &NarInfo) -> Response {
     request(
         app,
         "PUT",

@@ -1,4 +1,5 @@
-//! Nix cache HTTP routes (ADR 0006).
+//! Nix cache HTTP routes (ADR 0006) and named roots (ADR 0023).
+use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -94,7 +95,16 @@ impl UploadLimits {
     }
 }
 
-pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>, registry: Arc<Registry>) -> Router {
+/// Named roots are managed with `nix:pin`, every other write with `nix:write`.
+const ROOTS: &str = "/_oroshi/roots/";
+const MAX_ROOT_BYTES: u64 = 1024 * 1024;
+
+pub fn routes(
+    store: Arc<Store>,
+    write: Arc<Tokens>,
+    pin: Arc<Tokens>,
+    registry: Arc<Registry>,
+) -> Router {
     Router::new()
         .route(
             "/",
@@ -106,6 +116,12 @@ pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>, registry: Arc<Registry>) -
             get(cache_info).put(|| async { StatusCode::NO_CONTENT }),
         )
         .route("/:name", get(narinfo).put(put_narinfo))
+        .route(
+            "/_oroshi/roots/:name",
+            get(|| async { StatusCode::NOT_FOUND })
+                .put(put_root)
+                .delete(delete_root),
+        )
         .fallback(|method: Method| async move {
             if method == Method::PUT {
                 StatusCode::FORBIDDEN
@@ -119,7 +135,7 @@ pub fn routes(store: Arc<Store>, tokens: Arc<Tokens>, registry: Arc<Registry>) -
             observe_upload,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            tokens,
+            (write, pin),
             authorize_writes,
         ))
         .with_state(store)
@@ -183,6 +199,8 @@ async fn observe_upload(
         "nar"
     } else if request.uri().path().ends_with(".narinfo") {
         "narinfo"
+    } else if request.uri().path().starts_with(ROOTS) {
+        "root"
     } else {
         "other"
     };
@@ -215,14 +233,96 @@ async fn observe_upload(
 
 // Deny by default: every method except anonymous reads needs the write scope.
 async fn authorize_writes(
-    State(tokens): State<Arc<Tokens>>,
+    State((write, pin)): State<(Arc<Tokens>, Arc<Tokens>)>,
     request: Request,
     next: Next,
 ) -> Response {
     if matches!(*request.method(), Method::GET | Method::HEAD) {
         return next.run(request).await;
     }
+    let tokens = if request.uri().path().starts_with(ROOTS) {
+        pin
+    } else {
+        write
+    };
     auth::require_scope(State(tokens), request, next).await
+}
+
+fn root_name(name: &str) -> Result<(), UploadError> {
+    if (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(UploadError(StatusCode::BAD_REQUEST, "bad-name"))
+    }
+}
+
+/// Replace a root with the store paths of a `text/plain` body, one per line (ADR 0023).
+async fn put_root(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    body: Body,
+) -> Result<Response, UploadError> {
+    root_name(&name)?;
+    let reader = UploadReader::new(body, &store.limits);
+    let deadline = reader.deadline;
+    let task_name = name.clone();
+    let paths = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_ROOT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| read_failure(&error))?;
+        if bytes.len() as u64 > MAX_ROOT_BYTES {
+            return Err(UploadError(StatusCode::PAYLOAD_TOO_LARGE, "too-large"));
+        }
+        let failure = |reason| UploadError(StatusCode::BAD_REQUEST, reason);
+        let paths = std::str::from_utf8(&bytes)
+            .map_err(|_| failure("invalid-body"))?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| parse_store_path(line).map(|_| line.to_owned()))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|_| failure("bad-name"))?;
+        if paths.is_empty() {
+            return Err(failure("invalid-body"));
+        }
+        check_deadline(deadline)?;
+        store
+            .database
+            .set_root(&task_name, &paths)
+            .map_err(|error| match error {
+                DatabaseError::MissingReference => failure("missing-reference"),
+                _ => UploadError(StatusCode::INTERNAL_SERVER_ERROR, "storage-error"),
+            })?;
+        Ok(paths.len())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    // Logged on the request's task, where its subscriber is (not on the blocking thread).
+    tracing::info!(event = "root-set", name, paths);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// An unknown root is a plain 404, not a refusal (ADR 0023).
+async fn delete_root(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, UploadError> {
+    root_name(&name)?;
+    let task_name = name.clone();
+    let deleted = tokio::task::spawn_blocking(move || store.database.delete_root(&task_name))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !deleted {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    tracing::info!(event = "root-deleted", name);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn check_encoding(request: Request, next: Next) -> Response {

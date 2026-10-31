@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 #[cfg(test)]
 use std::fs;
@@ -335,17 +336,33 @@ impl Database {
                     "INSERT INTO reference (referrer, reference) VALUES (?1, ?2)",
                     rusqlite::params![info.store_path, reference],
                 )
-                .map_err(|error| match error {
-                    rusqlite::Error::SqliteFailure(ref failure, _)
-                        if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
-                    {
-                        DatabaseError::MissingReference
-                    }
-                    _ => DatabaseError::Sqlite(error),
-                })?;
+                .map_err(missing_reference)?;
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Replace root `name` with `paths` in one transaction (ADR 0023). A path without a
+    /// narinfo is `MissingReference` and leaves the previous content.
+    pub fn set_root(&self, name: &str, paths: &BTreeSet<String>) -> Result<(), DatabaseError> {
+        self.write(|transaction| {
+            transaction.execute("DELETE FROM root WHERE name = ?1", [name])?;
+            let mut insert =
+                transaction.prepare("INSERT INTO root (name, store_path) VALUES (?1, ?2)")?;
+            for path in paths {
+                insert
+                    .execute(rusqlite::params![name, path])
+                    .map_err(missing_reference)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove root `name`; `false` when it did not exist.
+    pub fn delete_root(&self, name: &str) -> Result<bool, DatabaseError> {
+        self.write(|transaction| {
+            Ok(transaction.execute("DELETE FROM root WHERE name = ?1", [name])? > 0)
+        })
     }
 
     /// Fetch the wire content serialized by `NarInfo` at commit time.
@@ -431,6 +448,17 @@ impl Database {
             pool: &self.readers,
             connection: Some(connection),
         })
+    }
+}
+
+fn missing_reference(error: rusqlite::Error) -> DatabaseError {
+    match error {
+        rusqlite::Error::SqliteFailure(ref failure, _)
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+        {
+            DatabaseError::MissingReference
+        }
+        _ => DatabaseError::Sqlite(error),
     }
 }
 

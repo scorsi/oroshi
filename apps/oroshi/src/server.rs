@@ -373,6 +373,12 @@ fn app(store: Arc<crate::nix::Store>, registry: Arc<Registry>, config: &Config) 
                     Module::Nix,
                     registry.clone(),
                 )),
+                Arc::new(crate::auth::Tokens::new(
+                    config,
+                    "nix:pin",
+                    Module::Nix,
+                    registry.clone(),
+                )),
                 registry.clone(),
             ),
         )
@@ -745,6 +751,9 @@ mod narinfo_tests;
 
 #[cfg(test)]
 mod observability_tests;
+
+#[cfg(test)]
+mod roots_tests;
 
 #[cfg(test)]
 mod review_tests {
