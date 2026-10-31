@@ -170,7 +170,7 @@ impl Database {
         Ok(())
     }
 
-    /// One `oroshi gc` run (ADR 0005): mark, delete the expired then the capped paths,
+    /// One `oroshi-server gc` run (ADR 0005): mark, delete the expired then the capped paths,
     /// sweep. `report` keeps the counts reached when an error stops the run.
     pub fn collect(
         &self,
@@ -215,7 +215,7 @@ impl Database {
     }
 }
 
-/// Counts of one `oroshi gc` run.
+/// Counts of one `oroshi-server gc` run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub deleted_entries: usize,

@@ -63,7 +63,7 @@ impl BlobStore {
         })
     }
 
-    /// Open the blob store of a running server from a second process (`oroshi gc`): never
+    /// Open the blob store of a running server from a second process (`oroshi-server gc`): never
     /// creates it and never sweeps `tmp/`, which holds the server's in-flight uploads.
     pub fn open_existing(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();

@@ -41,7 +41,7 @@ machine oroshi.example.org login builder password <token>
 Hash the exact token bytes, without an added newline:
 
 ```sh
-oroshi token hash < /run/secrets/oroshi-token
+oroshi-server token hash < /run/secrets/oroshi-token
 ```
 
 On the cache's NixOS configuration, after importing oroshi's module:
@@ -131,7 +131,7 @@ set. It is a logical cap on blob bytes: bound the filesystem with a quota as wel
 
 ## Retention and garbage collection
 
-`oroshi gc` deletes what is no longer kept; uploads and reads continue while it runs.
+`oroshi-server gc` deletes what is no longer kept; uploads and reads continue while it runs.
 
 - **Expiry**: a path not read or uploaded for `retention.days` (default 30) expires,
   unless a named root holds it or a path that is still kept references it. Reads
@@ -161,7 +161,7 @@ services.oroshi = {
 
 The module installs `oroshi-gc.timer` (`Persistent=true`: a run missed while the
 machine was off happens at the next boot) and `oroshi-gc.service`, a oneshot running
-`oroshi gc --config <path>` as the `oroshi` user with the server's sandbox. Run it now
+`oroshi-server gc --config <path>` as the `oroshi` user with the server's sandbox. Run it now
 with:
 
 ```sh
@@ -214,7 +214,7 @@ trusted key), run on the cache, as the `oroshi` user, against the module's
 configuration:
 
 ```sh
-sudo -u oroshi <oroshi-package>/bin/oroshi nix drop --config /etc/oroshi/oroshi.toml \
+sudo -u oroshi <oroshi-package>/bin/oroshi-server nix drop --config /etc/oroshi/oroshi.toml \
   /nix/store/<hash>-<name>
 ```
 
@@ -229,7 +229,7 @@ with a different NAR. There is no `--dry-run`.
 ## Refusals
 
 Upload responses use the closed plain-text reasons in
-[`apps/oroshi/src/nix.rs`](../apps/oroshi/src/nix.rs), logged as `upload-refused`;
+[`apps/oroshi-server/src/nix.rs`](../apps/oroshi-server/src/nix.rs), logged as `upload-refused`;
 authentication failures are logged as `auth-refused`. These lines and `request`
 carry `client`: the address in `X-Forwarded-For` (its rightmost entry) when the
 connection comes from a loopback address, as from the local reverse proxy, and the

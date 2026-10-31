@@ -2,7 +2,7 @@
 
 Architecture decisions of the package registry. Format: status, context, decision, consequences, rejected alternatives; optional open points record remaining risks or questions. These design drafts are edited in place until accepted.
 
-All ADRs are **Accepted** (0001-0022 on 2026-10-24, 0023-0029 on 2026-10-31). An accepted ADR is not modified: it is superseded by a new one. Decisions taken during a milestone or a review are recorded as one ADR per theme, never one ADR per event.
+All ADRs are **Accepted** (0001-0022 on 2026-10-24, 0023-0030 on 2026-10-31). An accepted ADR is not modified: it is superseded by a new one. Decisions taken during a milestone or a review are recorded as one ADR per theme, never one ADR per event.
 
 | No. | Title | Status |
 | --- | --- | --- |
@@ -35,6 +35,7 @@ All ADRs are **Accepted** (0001-0022 on 2026-10-24, 0023-0029 on 2026-10-31). An
 | [0027](0027-nixos-module-storage-max-bytes-optional.md) | NixOS module: `storage.maxBytes` optional | Accepted |
 | [0028](0028-gc-concurrency-test-coverage.md) | GC concurrency test coverage | Accepted |
 | [0029](0029-client-address-behind-local-proxy.md) | Client address behind the local proxy | Accepted |
+| [0030](0030-server-binary-name.md) | Server binary name | Accepted |
 
 Deployment values (addresses, ports, keys, token hashes, host selection and capacity) are not recorded here: they live in the deployment repository.
 

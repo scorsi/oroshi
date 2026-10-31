@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! `oroshi gc` and `oroshi nix drop` against a temporary state directory.
+//! `oroshi-server gc` and `oroshi-server nix drop` against a temporary state directory.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -103,7 +103,7 @@ impl State {
 
     /// `args --config <config> rest`.
     fn run_with(&self, args: &[&str], rest: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .env_remove("RUST_LOG")
             .args(args)
             .arg("--config")
@@ -219,7 +219,7 @@ fn gc_refuses_another_schema_version_without_creating_or_migrating() {
     std::fs::write(root.join("db/oroshi.sqlite"), b"").unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(&config, format!("[storage]\ndir = {root:?}\n")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .env_remove("RUST_LOG")
         .args(["gc", "--config"])
         .arg(&config)

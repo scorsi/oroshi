@@ -328,12 +328,15 @@ pub(crate) mod tests {
     #[test]
     fn target_filter_and_precedence() {
         let emit = || {
-            tracing::debug!(target: "oroshi", event = "request");
-            tracing::info!(target: "oroshi", event = "start");
+            tracing::debug!(target: "oroshi_server", event = "request");
+            tracing::info!(target: "oroshi_server", event = "start");
             tracing::info!(target: "dependency", event = "request");
             tracing::warn!(target: "dependency", event = "request");
         };
-        let lines = capture(filter("error", Some("warn,oroshi=debug")).unwrap(), emit);
+        let lines = capture(
+            filter("error", Some("warn,oroshi_server=debug")).unwrap(),
+            emit,
+        );
         let levels: Vec<Value> = lines
             .iter()
             .map(|line| serde_json::from_str::<Value>(line).unwrap()["level"].clone())
@@ -341,11 +344,15 @@ pub(crate) mod tests {
         assert_eq!(levels, ["debug", "info", "warn"]);
         assert_eq!(capture(filter("info", None).unwrap(), emit).len(), 3);
         assert_eq!(
-            capture(filter("error", Some("oroshi=verbose")).unwrap(), emit).len(),
+            capture(
+                filter("error", Some("oroshi_server=verbose")).unwrap(),
+                emit
+            )
+            .len(),
             0
         );
         assert!(
-            filter("oroshi=verbose", Some("info"))
+            filter("oroshi_server=verbose", Some("info"))
                 .unwrap_err()
                 .contains("log.level")
         );

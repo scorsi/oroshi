@@ -38,7 +38,7 @@ const MIGRATIONS: &[&str] = &[
      );
      INSERT INTO gc_state (id) VALUES (1);",
 ];
-/// How long a write waits for another process's write lock (server and `oroshi gc`).
+/// How long a write waits for another process's write lock (server and `oroshi-server gc`).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Idle read-only connections kept for reuse; extra concurrent readers are closed after use.
 const POOLED_READERS: usize = 16;
@@ -197,7 +197,7 @@ impl Database {
         Ok((Self::new(path, writer), applied))
     }
 
-    /// Open the database of a running server from a second process (`oroshi gc`): never
+    /// Open the database of a running server from a second process (`oroshi-server gc`): never
     /// creates or migrates it and refuses any schema version but this binary's (ADR 0013).
     /// Such a process must not call `BlobStore::open`: its temp sweep deletes in-flight uploads.
     pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, DatabaseError> {

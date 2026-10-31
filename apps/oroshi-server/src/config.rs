@@ -225,7 +225,7 @@ mod tests {
             format!("[server]\nlisten = '{secret}'"),
             format!("[nix]\npriority = '{secret}'"),
             format!("unexpected = '{secret}'"),
-            format!("[log]\nlevel = 'oroshi={secret}'"),
+            format!("[log]\nlevel = 'oroshi_server={secret}'"),
             format!("[nix]\ntrusted_keys = ['{secret}']"),
             format!("[server]\nlisten = '{secret}"),
         ] {

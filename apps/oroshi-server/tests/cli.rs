@@ -16,7 +16,7 @@ fn log_line(bytes: &[u8]) -> serde_json::Value {
 
 #[test]
 fn prints_package_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .arg("--version")
         .output()
         .unwrap();
@@ -24,7 +24,7 @@ fn prints_package_version() {
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
-        format!("oroshi {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+        format!("oroshi-server {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
     );
     assert!(output.stderr.is_empty());
 }
@@ -32,7 +32,7 @@ fn prints_package_version() {
 #[test]
 fn invalid_arguments_fail_with_usage() {
     for args in [vec![], vec!["serve"], vec!["--version", "extra"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .env_remove("RUST_LOG")
             .args(args)
             .output()
@@ -45,7 +45,7 @@ fn invalid_arguments_fail_with_usage() {
         assert_eq!(v["level"], "error");
         assert_eq!(
             v["err"],
-            "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path> | oroshi gc --config <path> | oroshi nix drop --config <path> [--with-referrers] <store-path>"
+            "usage: oroshi-server --version | oroshi-server token hash | oroshi-server config check [--config] <path> | oroshi-server serve --config <path> | oroshi-server gc --config <path> | oroshi-server nix drop --config <path> [--with-referrers] <store-path>"
         );
     }
 }
@@ -57,7 +57,7 @@ fn checks_example_with_both_path_forms() {
         vec!["config", "check", example],
         vec!["config", "check", "--config", example],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .env_remove("RUST_LOG")
             .args(args)
             .output()
@@ -71,7 +71,7 @@ fn checks_example_with_both_path_forms() {
 #[test]
 fn config_check_reports_file_errors() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml/not-a-config");
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .args(["config", "check", path])
         .output()
         .unwrap();
@@ -84,7 +84,7 @@ fn config_check_reports_file_errors() {
 
 #[test]
 fn config_check_reports_validation_errors() {
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .args([
             "config",
             "check",
@@ -101,7 +101,7 @@ fn config_check_reports_validation_errors() {
 
 #[test]
 fn log_level_is_validated_even_with_rust_log_override() {
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .env("RUST_LOG", "trace")
         .args([
             "config",
@@ -122,14 +122,14 @@ fn log_level_is_validated_even_with_rust_log_override() {
 #[test]
 fn config_check_stays_quiet_but_reports_errors_with_logging_off() {
     let example = concat!(env!("CARGO_MANIFEST_DIR"), "/../../nix/example.toml");
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .env("RUST_LOG", "off")
         .args(["config", "check", example])
         .output()
         .unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .env("RUST_LOG", "off")
         .args(["config", "check", "missing.toml"])
         .output()
@@ -153,7 +153,7 @@ fn serve_emits_start_before_reporting_bind_failure() {
     )
     .unwrap();
     for filter in ["info", "off"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .env("RUST_LOG", filter)
             .args(["serve", "--config"])
             .arg(&path)
@@ -221,7 +221,7 @@ fn notify_socket_and_lifecycle_events_follow_sigterm_and_sigint() {
     .unwrap();
     for signal in ["-TERM", "-INT"] {
         let mut service = Service(
-            Command::new(env!("CARGO_BIN_EXE_oroshi"))
+            Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
                 .env("RUST_LOG", "info")
                 .env("NOTIFY_SOCKET", &socket)
                 .args(["serve", "--config"])
@@ -317,7 +317,7 @@ fn token_hash_hashes_stdin_bytes_exactly() {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
     ] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .args(["token", "hash"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -339,7 +339,7 @@ fn token_hash_rejects_secret_arguments_without_echoing_them() {
         vec!["token", "hash", "--secret", "private-secret"],
         vec!["token", "hash", "--secret=private-secret"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .args(args)
             .output()
             .unwrap();
@@ -362,12 +362,12 @@ fn config_invalid_logs_never_echo_inline_values() {
     let secret = "token-looking-secret-0123456789";
     for input in [
         format!("[server]\nlisten = '{secret}'"),
-        format!("[log]\nlevel = 'oroshi={secret}'"),
+        format!("[log]\nlevel = 'oroshi_server={secret}'"),
         format!("unexpected = '{secret}'"),
         format!("[nix]\ntrusted_keys = ['{secret}']"),
     ] {
         std::fs::write(&path, input).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .args(["config", "check", "--config"])
             .arg(&path)
             .output()
@@ -403,7 +403,7 @@ fn store_open_failure_exits_without_ready_notification() {
             ),
         )
         .unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+        let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
             .env("NOTIFY_SOCKET", &socket)
             .env("RUST_LOG", "info")
             .args(["serve", "--config"])
@@ -426,7 +426,7 @@ fn store_open_failure_exits_without_ready_notification() {
 
 #[test]
 fn help_prints_usage_on_stdout_and_exits_zero() {
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .arg("--help")
         .output()
         .unwrap();
@@ -435,7 +435,7 @@ fn help_prints_usage_on_stdout_and_exits_zero() {
     assert!(
         std::str::from_utf8(&output.stdout)
             .unwrap()
-            .starts_with("usage: oroshi ")
+            .starts_with("usage: oroshi-server ")
     );
 }
 
@@ -454,7 +454,7 @@ fn second_serve_exits_fatal_without_removing_in_flight_uploads() {
         format!("[server]\nlisten = '127.0.0.1:0'\n[storage]\ndir = {state:?}"),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_oroshi"))
+    let output = Command::new(env!("CARGO_BIN_EXE_oroshi-server"))
         .env("RUST_LOG", "off")
         .env_remove("NOTIFY_SOCKET")
         .args(["serve", "--config"])

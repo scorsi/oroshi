@@ -116,9 +116,9 @@ in
     enable = lib.mkEnableOption "oroshi, the package registry";
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.oroshi;
-      defaultText = lib.literalExpression "oroshi.packages.\${system}.oroshi";
-      description = "The oroshi package.";
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.oroshi-server;
+      defaultText = lib.literalExpression "oroshi.packages.\${system}.oroshi-server";
+      description = "The oroshi-server package.";
     };
     listen = mkOption {
       type = types.str;
@@ -199,7 +199,7 @@ in
             };
             scopes = mkOption {
               type = types.listOf types.str;
-              description = "Token scopes, validated by oroshi config check.";
+              description = "Token scopes, validated by oroshi-server config check.";
             };
           };
         }
@@ -227,7 +227,7 @@ in
     settings = mkOption {
       inherit (toml) type;
       default = { };
-      description = "Raw TOML merged last, overriding typed fields; validated at build time by oroshi config check. Contains no secrets.";
+      description = "Raw TOML merged last, overriding typed fields; validated at build time by oroshi-server config check. Contains no secrets.";
     };
   };
 

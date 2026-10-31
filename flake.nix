@@ -54,15 +54,15 @@
         }:
         let
           craneLib = inputs.crane.mkLib pkgs;
-          oroshi = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
-          common = oroshi.passthru.common;
-          cargoArtifacts = oroshi.passthru.cargoArtifacts;
+          oroshi-server = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
+          common = oroshi-server.passthru.common;
+          cargoArtifacts = oroshi-server.passthru.cargoArtifacts;
           workspace = (lib.importTOML ./Cargo.toml).workspace;
         in
         {
           packages = {
-            inherit oroshi;
-            default = oroshi;
+            inherit oroshi-server;
+            default = oroshi-server;
           };
 
           devShells.default = pkgs.mkShell {
@@ -92,7 +92,7 @@
                 member: (lib.importTOML (./. + "/${member}/Cargo.toml")).package.version.workspace or false
               ) workspace.members;
               pkgs.runCommand "oroshi-versions" { } ''
-                for binary in ${oroshi}/bin/*; do
+                for binary in ${oroshi-server}/bin/*; do
                   test "$("$binary" --version)" = "$(basename "$binary") ${workspace.package.version}"
                 done
                 touch "$out"
@@ -102,7 +102,7 @@
             inherit
               inputs
               pkgs
-              oroshi
+              oroshi-server
               system
               ;
             self = inputs.self;

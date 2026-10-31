@@ -4,7 +4,7 @@
 
 *卸 (oroshi): wholesale — the warehouse that distributes goods to the shops.*
 
-**Status:** O0 task 1 — flake and Cargo workspace skeleton with `oroshi --version`. Accepted ADRs in [`docs/adr/`](docs/adr/README.md), plan in [`docs/milestones.md`](docs/milestones.md).
+**Status:** O0 task 1 — flake and Cargo workspace skeleton with `oroshi-server --version`. Accepted ADRs in [`docs/adr/`](docs/adr/README.md), plan in [`docs/milestones.md`](docs/milestones.md).
 
 ## Role
 

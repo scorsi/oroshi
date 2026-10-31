@@ -242,7 +242,7 @@ async fn commits_count_actual_bytes_and_scrapes_refresh_deduplicated_database_ga
             1_700_000_000 * runs
         )));
         if expected != 0 {
-            // Persisted by `oroshi gc`, read back on the next scrape.
+            // Persisted by `oroshi-server gc`, read back on the next scrape.
             reopened
                 .database
                 .record_gc_run(true, 3, 1_700_000_000)

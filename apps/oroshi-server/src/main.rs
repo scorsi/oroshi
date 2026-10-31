@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path> | oroshi gc --config <path> | oroshi nix drop --config <path> [--with-referrers] <store-path>";
+const USAGE: &str = "usage: oroshi-server --version | oroshi-server token hash | oroshi-server config check [--config] <path> | oroshi-server serve --config <path> | oroshi-server gc --config <path> | oroshi-server nix drop --config <path> [--with-referrers] <store-path>";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -82,7 +82,7 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Version => {
-            println!("oroshi {}", env!("CARGO_PKG_VERSION"));
+            println!("oroshi-server {}", env!("CARGO_PKG_VERSION"));
             return Ok(ExitCode::SUCCESS);
         }
         Command::TokenHash => {

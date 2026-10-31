@@ -160,7 +160,7 @@ pub struct Registry {
     auth_refusals: [Counter; 6],
     pub stored_bytes: Gauge,
     pub blobs: Gauge,
-    /// GC totals from `gc_state`, set at scrape time: `oroshi gc` has no listener (0011).
+    /// GC totals from `gc_state`, set at scrape time: `oroshi-server gc` has no listener (0011).
     pub gc_runs_ok: Gauge,
     pub gc_runs_error: Gauge,
     pub gc_freed_bytes: Gauge,

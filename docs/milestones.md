@@ -137,7 +137,7 @@ Publishing generated Go modules (protobuf) is a later addition with its own ADR.
 
 **Deliverable**: an alternative registry with publishing, plus pull-through of crates.io.
 
-Content: protocol ADR (sparse index, `config.json`, publish, yank/unyank, download), first **primary data**: backup ADR and `oroshi dump` (0004), tokens with `cargo:write`.
+Content: protocol ADR (sparse index, `config.json`, publish, yank/unyank, download), first **primary data**: backup ADR and `oroshi-server dump` (0004), tokens with `cargo:write`.
 
 **Acceptance criteria**: nixosTest `cargo`: `cargo publish` to oroshi, a second crate depending on it builds with `cargo build` from oroshi only; yank hides the version from resolution but keeps the download; crates.io pull-through from a fake upstream; dump then restore on a fresh node serves the same index; logs and metrics validate.
 

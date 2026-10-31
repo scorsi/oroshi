@@ -2,7 +2,7 @@
   inputs,
   self,
   pkgs,
-  oroshi,
+  oroshi-server,
   system,
 }:
 let
@@ -23,7 +23,7 @@ let
           system.stateVersion = "26.05";
           services.oroshi = {
             enable = true;
-            package = if native then oroshi else self.packages.${linux}.oroshi;
+            package = if native then oroshi-server else self.packages.${linux}.oroshi-server;
             listen = "127.0.0.1:8081";
             metrics.listen = "127.1.2.3:9000";
             stateDir = "/var/lib/oroshi-example";
@@ -134,6 +134,10 @@ in
     assert assertionsPass { services.oroshi.listen = lib.mkForce "[::1]:8080"; };
     # ADR 0027: maxBytes is optional.
     assert assertionsPass { services.oroshi.storage.maxBytes = lib.mkForce null; };
+    # ADR 0030: the units run the server binary.
+    assert lib.hasPrefix "${lib.getExe evaluated.services.oroshi.package} serve "
+      unit.serviceConfig.ExecStart;
+    assert lib.hasSuffix "/bin/oroshi-server" (lib.getExe evaluated.services.oroshi.package);
     assert gcUnit.serviceConfig.Type == "oneshot";
     assert
       gcUnit.serviceConfig.ExecStart == "${lib.getExe evaluated.services.oroshi.package} gc --config ${
@@ -197,7 +201,7 @@ in
     pkgs.runCommand "oroshi-module-metrics-refusal" { } ''touch "$out"'';
 
   module-config = pkgs.runCommand "oroshi-module-config" { } ''
-    ${lib.getExe oroshi} config check --config ${configFile { }}
+    ${lib.getExe oroshi-server} config check --config ${configFile { }}
     cmp ${configFile { }} ${
       (pkgs.formats.toml { }).generate "expected-oroshi.toml" {
         server.listen = "127.0.0.1:8081";

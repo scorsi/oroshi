@@ -70,8 +70,8 @@ pkgs.testers.runNixOSTest {
       systemd.services.oroshi = {
         wantedBy = lib.mkForce [ ];
         serviceConfig.ExecStart = lib.mkForce "${
-          self.packages.${pkgs.stdenv.hostPlatform.system}.oroshi
-        }/bin/oroshi serve --config /run/oroshi-test.toml";
+          self.packages.${pkgs.stdenv.hostPlatform.system}.oroshi-server
+        }/bin/oroshi-server serve --config /run/oroshi-test.toml";
       };
     };
 

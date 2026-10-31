@@ -6,7 +6,7 @@
 }:
 let
   common = {
-    pname = "oroshi";
+    pname = "oroshi-server";
     version = (lib.importTOML ../Cargo.toml).workspace.package.version;
     strictDeps = true;
     buildInputs = [ sqlite ];
@@ -17,7 +17,7 @@ let
       fileset = lib.fileset.unions [
         (craneLib.fileset.commonCargoSources ../.)
         ./example.toml
-        ../apps/oroshi/tests/fixtures
+        ../apps/oroshi-server/tests/fixtures
         ../crates/oroshi-nix/tests/fixtures
         ../crates/oroshi-store/src/schema.sql
       ];
@@ -31,7 +31,7 @@ craneLib.buildPackage (
     inherit cargoArtifacts;
     doCheck = false; # Tests run in checks.cargo-test.
     meta = {
-      mainProgram = "oroshi";
+      mainProgram = "oroshi-server";
       license = lib.licenses.asl20;
     };
     passthru = { inherit common cargoArtifacts; };

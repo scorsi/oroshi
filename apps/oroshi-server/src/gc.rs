@@ -1,4 +1,4 @@
-//! `oroshi gc` (ADR 0005, 0011, 0025) and `oroshi nix drop` (ADR 0026), both against
+//! `oroshi-server gc` (ADR 0005, 0011, 0025) and `oroshi-server nix drop` (ADR 0026), both against
 //! the live database under `gc.lock`.
 
 use std::fs::{File, OpenOptions};
@@ -10,7 +10,7 @@ use oroshi_store::{BlobStore, Database};
 
 use crate::config::Config;
 
-/// The lock shared by `oroshi gc` and `oroshi nix drop`; the server holds `oroshi.lock`.
+/// The lock shared by `oroshi-server gc` and `oroshi-server nix drop`; the server holds `oroshi.lock`.
 pub(crate) fn lock(root: &Path) -> Result<File, String> {
     crate::server::check_state_dir(root).map_err(|error| error.to_string())?;
     let file = OpenOptions::new()
@@ -84,7 +84,7 @@ fn collect(root: &Path, policy: &Policy, report: &mut Report) -> Result<(), Stri
     result.and(recorded)
 }
 
-/// `oroshi nix drop`: a refusal is returned as the command's error (`fatal`, ADR 0025).
+/// `oroshi-server nix drop`: a refusal is returned as the command's error (`fatal`, ADR 0025).
 pub fn drop_narinfo(config: &Config, store_path: &str, with_referrers: bool) -> Result<(), String> {
     let name = oroshi_nix::parse_store_path(store_path)
         .map(|_| &store_path["/nix/store/".len()..])

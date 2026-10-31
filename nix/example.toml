@@ -1,4 +1,4 @@
-# Validate with: oroshi config check --config nix/example.toml
+# Validate with: oroshi-server config check --config nix/example.toml
 [server]
 listen = "127.0.0.1:8080"
 
