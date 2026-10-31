@@ -295,6 +295,29 @@ pub(crate) fn register_nar(database: &Database, info: &NarInfo) {
         .unwrap();
 }
 
+/// Create the blob file `register_nar` requires, with arbitrary content.
+pub(crate) fn publish_file(root: &Path, hash: &[u8; 32]) {
+    let path = crate::blob_path(root, hash);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"blob").unwrap();
+}
+
+#[test]
+fn register_nar_refuses_a_blob_whose_file_is_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let database = Database::open(root.path()).unwrap().0;
+    let blob = Blob {
+        hash: [4; 32],
+        size: 4,
+    };
+    assert!(matches!(
+        database.register_nar("nar/a.nar", &blob, 1),
+        Err(DatabaseError::MissingBlob)
+    ));
+    assert!(database.nar_blob("nar/a.nar").unwrap().is_none());
+    assert_eq!(database.stored_bytes().unwrap(), 0);
+}
+
 pub(crate) fn stored_paths(database: &Database) -> Vec<String> {
     database
         .reader()
@@ -889,6 +912,7 @@ fn register_nar_waits_for_a_write_transaction_of_another_handle() {
     let root = tempfile::tempdir().unwrap();
     let server = Database::open(root.path()).unwrap().0;
     let gc = Database::open_existing(root.path()).unwrap();
+    publish_file(root.path(), &[7; 32]);
     let mut writer = gc.writer().unwrap();
     let transaction = writer.transaction().unwrap();
     std::thread::scope(|scope| {
@@ -1065,6 +1089,7 @@ fn every_nar_upload_refreshes_its_registration_time_only() {
             )
             .unwrap()
     };
+    publish_file(root.path(), &blob.hash);
     database.register_nar("nar/a.nar", &blob, 100).unwrap();
     assert_eq!(times(), (100, 100));
     database.register_nar("nar/a.nar", &blob, 500).unwrap();

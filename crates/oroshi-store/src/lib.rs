@@ -31,17 +31,7 @@ impl BlobStore {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();
         let layout = root.join("LAYOUT");
-        let initialize = match fs::read(&layout) {
-            Ok(version) if version == b"1" || version == b"1\n" => false,
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown LAYOUT version",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Err(error) => return Err(error),
-        };
+        let initialize = !check_layout(root)?;
         create_dir_all_durable(root, &mut sync_directory)?;
         sync_directory(root)?;
         for directory in [
@@ -66,6 +56,19 @@ impl BlobStore {
             temp.file.sync_all()?;
             fs::rename(&temp.path, layout)?;
             File::open(root)?.sync_all()?;
+        }
+        Ok(Self {
+            root: root.to_owned(),
+            publish: Mutex::new(()),
+        })
+    }
+
+    /// Open the blob store of a running server from a second process (`oroshi gc`): never
+    /// creates it and never sweeps `tmp/`, which holds the server's in-flight uploads.
+    pub fn open_existing(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref();
+        if !check_layout(root)? {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "missing LAYOUT"));
         }
         Ok(Self {
             root: root.to_owned(),
@@ -149,8 +152,25 @@ impl BlobStore {
     }
 
     fn blob_path(&self, hash: &[u8; 32]) -> PathBuf {
-        let name = hex(hash);
-        self.root.join("blobs/sha256").join(&name[..2]).join(name)
+        blob_path(&self.root, hash)
+    }
+}
+
+fn blob_path(root: &Path, hash: &[u8; 32]) -> PathBuf {
+    let name = hex(hash);
+    root.join("blobs/sha256").join(&name[..2]).join(name)
+}
+
+/// `true` for layout 1, `false` when the state directory has no layout yet.
+fn check_layout(root: &Path) -> io::Result<bool> {
+    match fs::read(root.join("LAYOUT")) {
+        Ok(version) if version == b"1" || version == b"1\n" => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown LAYOUT version",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

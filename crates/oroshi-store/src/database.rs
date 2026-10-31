@@ -27,6 +27,7 @@ const MIGRATIONS: &[&str] = &[
          PRIMARY KEY (name, store_path)
      );
      CREATE INDEX root_store_path ON root (store_path);
+     CREATE INDEX nar_blob_sha256 ON nar (blob_sha256);
      CREATE TABLE gc_state (
          id INTEGER PRIMARY KEY CHECK (id = 1),
          runs_success INTEGER NOT NULL DEFAULT 0,
@@ -52,6 +53,7 @@ pub enum DatabaseError {
     NarinfoConflict,
     MissingReference,
     MissingNar,
+    MissingBlob,
     FileHashMismatch,
     FileSizeMismatch,
     NarinfoTooLarge,
@@ -75,6 +77,7 @@ impl fmt::Display for DatabaseError {
             Self::NarinfoConflict => f.write_str("conflicting narinfo metadata"),
             Self::MissingReference => f.write_str("missing narinfo reference"),
             Self::MissingNar => f.write_str("narinfo URL names no registered NAR"),
+            Self::MissingBlob => f.write_str("blob file removed before its registration"),
             Self::FileHashMismatch => {
                 f.write_str("narinfo FileHash differs from the registered NAR")
             }
@@ -200,6 +203,23 @@ impl Database {
         }
     }
 
+    /// The state directory: the database lives in its `db/`.
+    pub(crate) fn root(&self) -> &Path {
+        self.path.parent().and_then(Path::parent).unwrap()
+    }
+
+    /// Run `body` in one write transaction (`IMMEDIATE`), committed when it succeeds.
+    pub(crate) fn write<T>(
+        &self,
+        body: impl FnOnce(&Connection) -> Result<T, DatabaseError>,
+    ) -> Result<T, DatabaseError> {
+        let mut writer = self.writer()?;
+        let transaction = writer.transaction()?;
+        let value = body(&transaction)?;
+        transaction.commit()?;
+        Ok(value)
+    }
+
     /// Total bytes of registered blobs, counting each content hash once.
     pub fn stored_bytes(&self) -> Result<u64, DatabaseError> {
         Ok(self
@@ -224,9 +244,13 @@ impl Database {
     /// Register a published blob and its NAR URL atomically; a duplicate only refreshes
     /// the NAR row's `registered_at`, the GC grace clock of a NAR no narinfo uses (0024).
     /// Call only after the blob's hash has been verified against its URL. `now` is Unix time.
+    /// The file is checked under the write lock: the sweep unlinks under it too (0024).
     pub fn register_nar(&self, url: &str, blob: &Blob, now: i64) -> Result<(), DatabaseError> {
         let mut writer = self.writer()?;
         let transaction = writer.transaction()?;
+        if !crate::blob_path(self.root(), &blob.hash).try_exists()? {
+            return Err(DatabaseError::MissingBlob);
+        }
         transaction.execute(
             "INSERT INTO blob (sha256, size, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (sha256) DO NOTHING",

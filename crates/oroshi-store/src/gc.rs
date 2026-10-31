@@ -3,9 +3,14 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::{Database, DatabaseError};
+use crate::{BlobStore, Database, DatabaseError};
 
 /// One narinfo as seen by the mark phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,12 +106,160 @@ impl Database {
     /// still unrooted, not accessed since the mark and referenced by no other narinfo
     /// (ADR 0005). Returns `false`, deleting nothing, when the re-check fails.
     pub fn delete_marked(&self, path: &MarkedPath) -> Result<bool, DatabaseError> {
-        let mut writer = self.writer()?;
-        let transaction = writer.transaction()?;
-        let deleted = delete_marked(&transaction, path)?;
-        transaction.commit()?;
-        Ok(deleted)
+        self.write(|transaction| delete_marked(transaction, path))
     }
+
+    /// Sweep after the row deletes (ADR 0005, 0024): `nar` rows no narinfo uses, registered
+    /// at least `grace` seconds before `now`; `blob` rows no `nar` row uses, with their files;
+    /// files under `blobs/` without a row and files in `tmp/`, modified at least `grace`
+    /// seconds before `now`. `blobs` must be opened with `BlobStore::open_existing` by a
+    /// second process. A file already gone is not an error.
+    pub fn sweep(&self, blobs: &BlobStore, now: i64, grace: i64) -> Result<Swept, DatabaseError> {
+        let cutoff = now - grace;
+        let mut swept = Swept {
+            nars: self.writer()?.execute(
+                "DELETE FROM nar WHERE registered_at <= ?1
+                 AND NOT EXISTS (SELECT 1 FROM narinfo WHERE nar_url = nar.url)",
+                [cutoff],
+            )?,
+            ..Swept::default()
+        };
+        let unused: Vec<[u8; 32]> = self
+            .reader()?
+            .prepare(
+                "SELECT sha256 FROM blob
+                 WHERE NOT EXISTS (SELECT 1 FROM nar WHERE blob_sha256 = blob.sha256)",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for hash in unused {
+            if let Some(size) = self.write(|transaction| sweep_blob(transaction, blobs, &hash))? {
+                swept.blobs += 1;
+                swept.freed_bytes += size;
+            }
+        }
+        for directory in entries(&blobs.root.join("blobs/sha256"))? {
+            if !directory.is_dir() {
+                continue;
+            }
+            for file in entries(&directory)? {
+                let hash = file.file_name().and_then(|name| parse_hex(name.to_str()?));
+                if let Some(size) =
+                    self.write(|transaction| sweep_orphan(transaction, &file, hash, cutoff))?
+                {
+                    swept.orphan_files += 1;
+                    swept.freed_bytes += size;
+                }
+            }
+        }
+        for file in entries(&blobs.root.join("tmp"))? {
+            if older_file(&file, cutoff)?.is_some() && remove(&file)? {
+                swept.temp_files += 1;
+            }
+        }
+        Ok(swept)
+    }
+}
+
+/// What one sweep removed; `freed_bytes` counts blob rows and orphan files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub nars: usize,
+    pub blobs: usize,
+    pub orphan_files: usize,
+    pub temp_files: usize,
+    pub freed_bytes: u64,
+}
+
+/// Delete an unused blob row and unlink its file before the commit (ADR 0024).
+fn sweep_blob(
+    transaction: &Connection,
+    blobs: &BlobStore,
+    hash: &[u8; 32],
+) -> Result<Option<u64>, DatabaseError> {
+    let size: Option<u64> = transaction
+        .query_row(
+            "SELECT size FROM blob WHERE sha256 = ?1
+             AND NOT EXISTS (SELECT 1 FROM nar WHERE blob_sha256 = ?1)",
+            [hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if size.is_some() {
+        transaction.execute("DELETE FROM blob WHERE sha256 = ?1", [hash.as_slice()])?;
+        remove(&blobs.blob_path(hash))?;
+    }
+    Ok(size)
+}
+
+/// Unlink a file under `blobs/` that has no row and is older than the cutoff. Checked under
+/// the write lock, so a registration of the same content commits first or fails cleanly.
+fn sweep_orphan(
+    transaction: &Connection,
+    file: &Path,
+    hash: Option<[u8; 32]>,
+    cutoff: i64,
+) -> Result<Option<u64>, DatabaseError> {
+    if let Some(hash) = hash
+        && transaction
+            .query_row(
+                "SELECT 1 FROM blob WHERE sha256 = ?1",
+                [hash.as_slice()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(match older_file(file, cutoff)? {
+        Some(size) if remove(file)? => Some(size),
+        _ => None,
+    })
+}
+
+/// Paths in `directory`, which may be missing.
+fn entries(directory: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::read_dir(directory) {
+        Ok(entries) => entries.map(|entry| Ok(entry?.path())).collect(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The size of a regular file modified at or before `cutoff` (Unix seconds).
+fn older_file(path: &Path, cutoff: i64) -> io::Result<Option<u64>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |age| age.as_secs() as i64);
+    Ok((metadata.is_file() && modified <= cutoff).then_some(metadata.len()))
+}
+
+/// Unlink a file; `false` when it was already gone.
+fn remove(path: &Path) -> io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The hash named by a blob file, written by `hex`.
+fn parse_hex(name: &str) -> Option<[u8; 32]> {
+    let mut hash = [0; 32];
+    if name.len() != 64 || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    for (i, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&name[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(hash)
 }
 
 fn delete_marked(transaction: &Connection, path: &MarkedPath) -> Result<bool, DatabaseError> {
@@ -258,10 +411,10 @@ impl Space {
         for nar in &snapshot.nars {
             // A NAR row inside the grace survives the sweep even when no narinfo uses it.
             let protected = policy.now - nar.registered_at < policy.orphan_grace;
-            if protected || users.contains_key(&nar.url) {
-                if let Some(blob) = blobs.get_mut(&nar.blob) {
-                    blob.0 += 1;
-                }
+            if (protected || users.contains_key(&nar.url))
+                && let Some(blob) = blobs.get_mut(&nar.blob)
+            {
+                blob.0 += 1;
             }
             if !protected {
                 sweepable.insert(nar.url.clone(), nar.blob);

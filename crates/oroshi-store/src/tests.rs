@@ -293,3 +293,22 @@ fn expired_deadline_refuses_publication_and_removes_temp_file() {
     let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
     assert!(store.write_until(&b"abc"[..], 3, None, Some(later)).is_ok());
 }
+
+#[test]
+fn existing_open_keeps_temp_files_and_refuses_a_missing_or_unknown_layout() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        BlobStore::open_existing(root.path()).err().unwrap().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(!root.path().join("tmp").exists());
+    drop(BlobStore::open(root.path()).unwrap());
+    fs::write(root.path().join("tmp/upload"), b"partial").unwrap();
+    assert!(BlobStore::open_existing(root.path()).is_ok());
+    assert!(root.path().join("tmp/upload").exists());
+    fs::write(root.path().join("LAYOUT"), b"2\n").unwrap();
+    assert_eq!(
+        BlobStore::open_existing(root.path()).err().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+}

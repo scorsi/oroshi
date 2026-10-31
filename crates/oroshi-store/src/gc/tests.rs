@@ -438,3 +438,217 @@ mod deletes {
         assert!(edges(&gc).is_empty());
     }
 }
+
+mod sweep {
+    use std::fs;
+    use std::io::Read;
+    use std::time::Duration;
+
+    use crate::database::tests::{libiconv, register_nar};
+    use crate::{Blob, BlobStore, Database, DatabaseError};
+
+    const GRACE: i64 = 3600;
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// A server (store and database) and a second process's `gc` handles on one directory.
+    struct State {
+        dir: tempfile::TempDir,
+        server: (BlobStore, Database),
+        gc: (BlobStore, Database),
+    }
+
+    fn state() -> State {
+        let dir = tempfile::tempdir().unwrap();
+        let server = (
+            BlobStore::open(dir.path()).unwrap(),
+            Database::open(dir.path()).unwrap().0,
+        );
+        let gc = (
+            BlobStore::open_existing(dir.path()).unwrap(),
+            Database::open_existing(dir.path()).unwrap(),
+        );
+        State { dir, server, gc }
+    }
+
+    impl State {
+        fn sweep(&self, now: i64) -> super::Swept {
+            self.gc.1.sweep(&self.gc.0, now, GRACE).unwrap()
+        }
+
+        fn blob_rows(&self) -> i64 {
+            self.server
+                .1
+                .reader()
+                .unwrap()
+                .query_row("SELECT count(*) FROM blob", [], |row| row.get(0))
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn a_blob_written_but_not_committed_survives_inside_the_grace_and_goes_after_it() {
+        let state = state();
+        let blob = state.server.0.write(&b"orphan"[..], 6, None).unwrap();
+        let now = now();
+        assert_eq!(state.sweep(now), super::Swept::default());
+        assert!(state.server.0.open_blob(&blob.hash).is_ok());
+        let swept = state.sweep(now + GRACE + 1);
+        assert_eq!((swept.orphan_files, swept.freed_bytes), (1, 6));
+        assert!(state.server.0.open_blob(&blob.hash).is_err());
+    }
+
+    #[test]
+    fn an_in_flight_temp_file_survives_inside_the_grace() {
+        let state = state();
+        let temp = state.dir.path().join("tmp/upload");
+        fs::write(&temp, b"partial").unwrap();
+        // Opening the gc's store never sweeps tmp/, unlike the server's startup.
+        drop(BlobStore::open_existing(state.dir.path()).unwrap());
+        assert_eq!(state.sweep(now()).temp_files, 0);
+        assert!(temp.exists());
+        assert_eq!(state.sweep(now() + GRACE + 1).temp_files, 1);
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn unused_nar_rows_go_after_their_registration_grace_with_their_blobs() {
+        let state = state();
+        // A path still in use keeps its NAR and blob rows (its file is not even present).
+        register_nar(&state.server.1, &libiconv());
+        state
+            .server
+            .1
+            .commit_narinfo(&libiconv(), &[], "upload", 1)
+            .unwrap();
+        // An old blob uploaded again recently: the grace counts from the new upload.
+        let blob = state.server.0.write(&b"nar"[..], 3, None).unwrap();
+        state.server.1.register_nar("nar/a.nar", &blob, 0).unwrap();
+        let now = now();
+        state
+            .server
+            .1
+            .register_nar("nar/a.nar", &blob, now)
+            .unwrap();
+        let swept = state.sweep(now + GRACE - 1);
+        assert_eq!((swept.nars, swept.blobs), (0, 0));
+        assert!(state.server.1.nar_blob("nar/a.nar").unwrap().is_some());
+
+        let swept = state.sweep(now + GRACE);
+        assert_eq!(
+            (
+                swept.nars,
+                swept.blobs,
+                swept.orphan_files,
+                swept.freed_bytes
+            ),
+            (1, 1, 0, 3)
+        );
+        assert!(state.server.1.nar_blob("nar/a.nar").unwrap().is_none());
+        assert!(state.server.0.open_blob(&blob.hash).is_err());
+        assert_eq!(state.blob_rows(), 1);
+        assert!(state.server.1.nar_blob(&libiconv().url).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unused_blob_row_whose_file_is_already_gone_is_swept_without_error() {
+        let state = state();
+        let blob = state.server.0.write(&b"gone"[..], 4, None).unwrap();
+        state.server.1.register_nar("nar/a.nar", &blob, 0).unwrap();
+        fs::remove_file(crate::blob_path(state.dir.path(), &blob.hash)).unwrap();
+        let swept = state.sweep(now() + GRACE);
+        assert_eq!((swept.nars, swept.blobs), (1, 1));
+        assert_eq!(state.blob_rows(), 0);
+    }
+
+    /// A blob row no NAR row uses, with its file: what a deduplicated upload reuses.
+    fn unused_blob(state: &State) -> Blob {
+        let blob = state.server.0.write(&b"shared"[..], 6, None).unwrap();
+        state
+            .server
+            .1
+            .register_nar("nar/old.nar", &blob, 0)
+            .unwrap();
+        state
+            .server
+            .1
+            .writer()
+            .unwrap()
+            .execute("DELETE FROM nar", [])
+            .unwrap();
+        blob
+    }
+
+    #[test]
+    fn a_deduplicated_registration_before_the_sweep_keeps_the_blob() {
+        let state = state();
+        let blob = unused_blob(&state);
+        // The upload found the file in place (no rename) and registers before the sweep.
+        assert_eq!(state.server.0.write(&b"shared"[..], 6, None).unwrap(), blob);
+        state
+            .server
+            .1
+            .register_nar("nar/new.nar", &blob, now())
+            .unwrap();
+        assert_eq!(state.sweep(now()).blobs, 0);
+        assert!(state.server.0.open_blob(&blob.hash).is_ok());
+    }
+
+    #[test]
+    fn a_deduplicated_registration_waiting_on_the_sweep_fails_and_its_retry_succeeds() {
+        let state = state();
+        let blob = unused_blob(&state);
+        assert_eq!(state.server.0.write(&b"shared"[..], 6, None).unwrap(), blob);
+        let mut writer = state.gc.1.writer().unwrap();
+        let transaction = writer.transaction().unwrap();
+        std::thread::scope(|scope| {
+            let upload = scope.spawn(|| state.server.1.register_nar("nar/new.nar", &blob, now()));
+            // The registration now waits on the sweep's write lock (busy timeout).
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                super::super::sweep_blob(&transaction, &state.gc.0, &blob.hash).unwrap(),
+                Some(6)
+            );
+            transaction.commit().unwrap();
+            assert!(matches!(
+                upload.join().unwrap(),
+                Err(DatabaseError::MissingBlob)
+            ));
+        });
+        drop(writer);
+        assert_eq!(state.blob_rows(), 0);
+        assert!(state.server.0.open_blob(&blob.hash).is_err());
+        // The client retries: the upload publishes the file again and registers it.
+        assert_eq!(state.server.0.write(&b"shared"[..], 6, None).unwrap(), blob);
+        state
+            .server
+            .1
+            .register_nar("nar/new.nar", &blob, now())
+            .unwrap();
+        assert!(state.server.0.open_blob(&blob.hash).is_ok());
+    }
+
+    #[test]
+    fn a_download_opened_before_the_unlink_streams_to_the_end() {
+        let state = state();
+        let content = vec![7; 200 * 1024];
+        let blob = state
+            .server
+            .0
+            .write(content.as_slice(), content.len() as u64, None)
+            .unwrap();
+        let mut download = state.server.0.open_blob(&blob.hash).unwrap();
+        let mut start = [0; 1024];
+        download.read_exact(&mut start).unwrap();
+        assert_eq!(state.sweep(now() + GRACE + 1).orphan_files, 1);
+        assert!(state.server.0.open_blob(&blob.hash).is_err());
+        let mut rest = Vec::new();
+        download.read_to_end(&mut rest).unwrap();
+        assert_eq!(start.len() + rest.len(), content.len());
+    }
+}
