@@ -231,7 +231,26 @@ async fn commits_count_actual_bytes_and_scrapes_refresh_deduplicated_database_ga
             "{text}"
         );
         assert!(text.contains(&format!("oroshi_blobs {}\n", usize::from(expected != 0))));
+        let runs = usize::from(expected == 0);
+        assert!(text.contains(&format!("oroshi_gc_runs_total{{result=\"ok\"}} {runs}\n")));
+        assert!(text.contains(&format!(
+            "oroshi_gc_runs_total{{result=\"error\"}} {runs}\n"
+        )));
+        assert!(text.contains(&format!("oroshi_gc_freed_bytes_total {}\n", 7 * runs)));
+        assert!(text.contains(&format!(
+            "oroshi_gc_last_success_timestamp_seconds {}\n",
+            1_700_000_000 * runs
+        )));
         if expected != 0 {
+            // Persisted by `oroshi gc`, read back on the next scrape.
+            reopened
+                .database
+                .record_gc_run(true, 3, 1_700_000_000)
+                .unwrap();
+            reopened
+                .database
+                .record_gc_run(false, 4, 1_800_000_000)
+                .unwrap();
             reopened
                 .database
                 .writer()

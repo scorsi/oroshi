@@ -223,3 +223,13 @@ oroshi_stored_bytes 100
 # HELP oroshi_blobs Registered blobs.
 # TYPE oroshi_blobs gauge
 oroshi_blobs 1
+# HELP oroshi_gc_runs_total GC runs.
+# TYPE oroshi_gc_runs_total counter
+oroshi_gc_runs_total{result="ok"} 4
+oroshi_gc_runs_total{result="error"} 1
+# HELP oroshi_gc_freed_bytes_total Bytes freed by GC.
+# TYPE oroshi_gc_freed_bytes_total counter
+oroshi_gc_freed_bytes_total 2048
+# HELP oroshi_gc_last_success_timestamp_seconds Unix time of the last successful GC run, 0 before any.
+# TYPE oroshi_gc_last_success_timestamp_seconds gauge
+oroshi_gc_last_success_timestamp_seconds 1700000000

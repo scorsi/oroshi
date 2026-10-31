@@ -160,6 +160,11 @@ pub struct Registry {
     auth_refusals: [Counter; 6],
     pub stored_bytes: Gauge,
     pub blobs: Gauge,
+    /// GC totals from `gc_state`, set at scrape time: `oroshi gc` has no listener (0011).
+    pub gc_runs_ok: Gauge,
+    pub gc_runs_error: Gauge,
+    pub gc_freed_bytes: Gauge,
+    pub gc_last_success: Gauge,
 }
 impl Default for Registry {
     fn default() -> Self {
@@ -178,6 +183,10 @@ impl Registry {
             auth_refusals: Default::default(),
             stored_bytes: Default::default(),
             blobs: Default::default(),
+            gc_runs_ok: Default::default(),
+            gc_runs_error: Default::default(),
+            gc_freed_bytes: Default::default(),
+            gc_last_success: Default::default(),
         }
     }
 
@@ -315,6 +324,29 @@ impl Registry {
         writeln!(out, "oroshi_stored_bytes {}", self.stored_bytes.get()).unwrap();
         out.push_str("# HELP oroshi_blobs Registered blobs.\n# TYPE oroshi_blobs gauge\n");
         writeln!(out, "oroshi_blobs {}", self.blobs.get()).unwrap();
+        out.push_str("# HELP oroshi_gc_runs_total GC runs.\n# TYPE oroshi_gc_runs_total counter\n");
+        for (result, runs) in [("ok", &self.gc_runs_ok), ("error", &self.gc_runs_error)] {
+            writeln!(
+                out,
+                "oroshi_gc_runs_total{{result=\"{result}\"}} {}",
+                runs.get()
+            )
+            .unwrap();
+        }
+        out.push_str("# HELP oroshi_gc_freed_bytes_total Bytes freed by GC.\n# TYPE oroshi_gc_freed_bytes_total counter\n");
+        writeln!(
+            out,
+            "oroshi_gc_freed_bytes_total {}",
+            self.gc_freed_bytes.get()
+        )
+        .unwrap();
+        out.push_str("# HELP oroshi_gc_last_success_timestamp_seconds Unix time of the last successful GC run, 0 before any.\n# TYPE oroshi_gc_last_success_timestamp_seconds gauge\n");
+        writeln!(
+            out,
+            "oroshi_gc_last_success_timestamp_seconds {}",
+            self.gc_last_success.get()
+        )
+        .unwrap();
         out
     }
 }
@@ -338,6 +370,10 @@ mod tests {
         registry.auth_refusals(Module::Nix).add(3);
         registry.stored_bytes.set(100);
         registry.blobs.set(1);
+        registry.gc_runs_ok.set(4);
+        registry.gc_runs_error.set(1);
+        registry.gc_freed_bytes.set(2048);
+        registry.gc_last_success.set(1_700_000_000);
         registry
             .duration(Module::Other)
             .observe(Duration::from_millis(250));
@@ -364,12 +400,12 @@ mod tests {
         let durations = MODULES.len() * (BOUNDS_MS.len() + 3);
         assert_eq!(requests, 120);
         assert_eq!(durations, 54);
-        assert_eq!(samples, 1 + requests + durations + MODULES.len() * 5 + 2);
-        assert_eq!(samples, 207);
-        // ADR 0011 reserves the four GC series for O2.
-        let later = 4;
-        assert_eq!(samples + later, 211);
-        assert!(samples + later <= 500);
+        assert_eq!(
+            samples,
+            1 + requests + durations + MODULES.len() * 5 + 2 + 4
+        );
+        // ADR 0011's budget, GC series included.
+        assert_eq!(samples, 211);
     }
 
     #[test]

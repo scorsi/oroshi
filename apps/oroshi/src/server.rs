@@ -453,20 +453,27 @@ async fn exposition(
     State((registry, store)): State<(Arc<Registry>, Arc<crate::nix::Store>)>,
 ) -> Result<([(header::HeaderName, &'static str); 1], String), StatusCode> {
     let start = Instant::now();
-    let (bytes, blobs) = tokio::task::spawn_blocking(move || {
-        store.database.reader().and_then(|reader| {
+    let ((bytes, blobs), gc) = tokio::task::spawn_blocking(move || {
+        let totals = store.database.reader().and_then(|reader| {
             Ok(reader.query_row(
                 "SELECT coalesce(sum(size), 0), count(*) FROM blob",
                 [],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )?)
-        })
+        })?;
+        Ok::<_, oroshi_store::DatabaseError>((totals, store.database.gc_state()?))
     })
     .await
     .map_err(|error| metrics_failure(&error, start))?
     .map_err(|error| metrics_failure(&error, start))?;
     registry.stored_bytes.set(bytes);
     registry.blobs.set(blobs);
+    registry.gc_runs_ok.set(gc.runs_success as i64);
+    registry.gc_runs_error.set(gc.runs_error as i64);
+    registry.gc_freed_bytes.set(gc.freed_bytes as i64);
+    registry
+        .gc_last_success
+        .set(gc.last_success_at.unwrap_or(0));
     Ok((
         [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
         registry.exposition(),
