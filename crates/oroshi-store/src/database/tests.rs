@@ -252,7 +252,7 @@ fn invalid_database_directory_returns_a_filesystem_error() {
     ));
 }
 
-fn libiconv() -> NarInfo {
+pub(crate) fn libiconv() -> NarInfo {
     include_str!(
         "../../../oroshi-nix/tests/fixtures/narinfo/cache-np8ldxalhj7qkmmf3p5gxx2d9nnm5q3x.narinfo"
     )
@@ -260,7 +260,7 @@ fn libiconv() -> NarInfo {
     .unwrap()
 }
 
-fn hello() -> NarInfo {
+pub(crate) fn hello() -> NarInfo {
     include_str!(
         "../../../oroshi-nix/tests/fixtures/narinfo/cache-f6ivp5fiw1nwq690548fb9qr8p968mj5.narinfo"
     )
@@ -279,7 +279,7 @@ fn trusted_keys() -> Vec<PublicKey> {
     .collect()
 }
 
-fn register_nar(database: &Database, info: &NarInfo) {
+pub(crate) fn register_nar(database: &Database, info: &NarInfo) {
     let writer = database.writer().unwrap();
     writer
         .execute(
@@ -295,7 +295,7 @@ fn register_nar(database: &Database, info: &NarInfo) {
         .unwrap();
 }
 
-fn stored_paths(database: &Database) -> Vec<String> {
+pub(crate) fn stored_paths(database: &Database) -> Vec<String> {
     database
         .reader()
         .unwrap()
@@ -307,7 +307,7 @@ fn stored_paths(database: &Database) -> Vec<String> {
         .unwrap()
 }
 
-fn edges(database: &Database) -> Vec<(String, String)> {
+pub(crate) fn edges(database: &Database) -> Vec<(String, String)> {
     database
         .reader()
         .unwrap()

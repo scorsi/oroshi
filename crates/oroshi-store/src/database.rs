@@ -440,4 +440,4 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<Vec<usize
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -3,6 +3,8 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
+use rusqlite::{Connection, OptionalExtension};
+
 use crate::{Database, DatabaseError};
 
 /// One narinfo as seen by the mark phase.
@@ -92,6 +94,47 @@ impl Database {
         transaction.commit()?;
         Ok(snapshot)
     }
+}
+
+impl Database {
+    /// Delete one marked path in its own write transaction, after re-checking that it is
+    /// still unrooted, not accessed since the mark and referenced by no other narinfo
+    /// (ADR 0005). Returns `false`, deleting nothing, when the re-check fails.
+    pub fn delete_marked(&self, path: &MarkedPath) -> Result<bool, DatabaseError> {
+        let mut writer = self.writer()?;
+        let transaction = writer.transaction()?;
+        let deleted = delete_marked(&transaction, path)?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+}
+
+fn delete_marked(transaction: &Connection, path: &MarkedPath) -> Result<bool, DatabaseError> {
+    let eligible = transaction
+        .query_row(
+            "SELECT last_accessed_at = ?2
+                 AND NOT EXISTS (SELECT 1 FROM root WHERE store_path = ?1)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM reference WHERE reference = ?1 AND referrer != ?1
+                 )
+             FROM narinfo WHERE store_path = ?1",
+            rusqlite::params![path.store_path, path.last_accessed_at],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if eligible {
+        // Outgoing edges first: the self-edge would otherwise block the narinfo's delete.
+        transaction.execute(
+            "DELETE FROM reference WHERE referrer = ?1",
+            [&path.store_path],
+        )?;
+        transaction.execute(
+            "DELETE FROM narinfo WHERE store_path = ?1",
+            [&path.store_path],
+        )?;
+    }
+    Ok(eligible)
 }
 
 /// The mark phase: a pure function of the snapshot and the policy (ADR 0005).

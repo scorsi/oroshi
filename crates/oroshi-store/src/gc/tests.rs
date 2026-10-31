@@ -327,3 +327,114 @@ proptest! {
         }
     }
 }
+
+mod deletes {
+    use std::time::Duration;
+
+    use crate::database::tests::{edges, hello, libiconv, register_nar, stored_paths};
+    use crate::{Database, DatabaseError};
+
+    use super::*;
+
+    /// libiconv (self-referencing) committed at time 1, its NAR registered.
+    fn with_libiconv() -> (tempfile::TempDir, Database) {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path()).unwrap().0;
+        register_nar(&database, &libiconv());
+        database
+            .commit_narinfo(&libiconv(), &[], "upload", 1)
+            .unwrap();
+        (root, database)
+    }
+
+    fn marked(database: &Database, store_path: &str) -> MarkedPath {
+        let snapshot = database.gc_snapshot().unwrap();
+        snapshot
+            .paths
+            .into_iter()
+            .find(|path| path.store_path == store_path)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_expired_self_referencing_path_goes_with_its_self_edge_unless_referenced() {
+        let (_root, database) = with_libiconv();
+        register_nar(&database, &hello());
+        database.commit_narinfo(&hello(), &[], "upload", 1).unwrap();
+        let libiconv = marked(&database, &libiconv().store_path);
+        let hello = marked(&database, &hello().store_path);
+
+        assert!(!database.delete_marked(&libiconv).unwrap());
+        assert_eq!(stored_paths(&database).len(), 2);
+        assert!(database.delete_marked(&hello).unwrap());
+        assert!(database.delete_marked(&libiconv).unwrap());
+        assert!(stored_paths(&database).is_empty());
+        assert!(edges(&database).is_empty());
+        // Already gone: skipped, not an error.
+        assert!(!database.delete_marked(&libiconv).unwrap());
+    }
+
+    #[test]
+    fn a_rooted_or_accessed_path_is_skipped() {
+        let (root, database) = with_libiconv();
+        let path = marked(&database, &libiconv().store_path);
+        database
+            .writer()
+            .unwrap()
+            .execute("INSERT INTO root VALUES ('keep', ?1)", [&path.store_path])
+            .unwrap();
+        assert!(!database.delete_marked(&path).unwrap());
+        database
+            .writer()
+            .unwrap()
+            .execute("DELETE FROM root", [])
+            .unwrap();
+
+        // A read from the server between mark and delete saves the path.
+        let server = Database::open(root.path()).unwrap().0;
+        let store_hash = &path.store_path["/nix/store/".len()..][..32];
+        assert_eq!(server.record_narinfo_access(store_hash, 10_000).unwrap(), 1);
+        assert!(!database.delete_marked(&path).unwrap());
+        assert_eq!(stored_paths(&database), [path.store_path]);
+    }
+
+    #[test]
+    fn a_commit_before_the_delete_of_its_reference_keeps_both() {
+        let (root, gc) = with_libiconv();
+        let server = Database::open(root.path()).unwrap().0;
+        let path = marked(&gc, &libiconv().store_path);
+        register_nar(&server, &hello());
+        server.commit_narinfo(&hello(), &[], "upload", 1).unwrap();
+        assert!(!gc.delete_marked(&path).unwrap());
+        assert_eq!(stored_paths(&gc).len(), 2);
+        assert!(
+            edges(&gc)
+                .iter()
+                .any(|(from, to)| *from == hello().store_path && *to == path.store_path)
+        );
+    }
+
+    #[test]
+    fn a_commit_waiting_on_the_delete_of_its_reference_fails_without_a_dangling_edge() {
+        let (root, gc) = with_libiconv();
+        let server = Database::open(root.path()).unwrap().0;
+        let path = marked(&gc, &libiconv().store_path);
+        register_nar(&server, &hello());
+        let mut writer = gc.writer().unwrap();
+        let transaction = writer.transaction().unwrap();
+        std::thread::scope(|scope| {
+            let upload = scope.spawn(|| server.commit_narinfo(&hello(), &[], "upload", 1));
+            // The upload now waits on the delete's write lock (busy timeout).
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(super::super::delete_marked(&transaction, &path).unwrap());
+            transaction.commit().unwrap();
+            assert!(matches!(
+                upload.join().unwrap(),
+                Err(DatabaseError::MissingReference)
+            ));
+        });
+        drop(writer);
+        assert!(stored_paths(&gc).is_empty());
+        assert!(edges(&gc).is_empty());
+    }
+}
