@@ -1,4 +1,5 @@
-//! `oroshi gc` (ADR 0005, 0011, 0025): one run against the live database.
+//! `oroshi gc` (ADR 0005, 0011, 0025) and `oroshi nix drop` (ADR 0026), both against
+//! the live database under `gc.lock`.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -81,4 +82,25 @@ fn collect(root: &Path, policy: &Policy, report: &mut Report) -> Result<(), Stri
         .record_gc_run(result.is_ok(), report.swept.freed_bytes, policy.now)
         .map_err(|error| error.to_string());
     result.and(recorded)
+}
+
+/// `oroshi nix drop`: a refusal is returned as the command's error (`fatal`, ADR 0025).
+pub fn drop_narinfo(config: &Config, store_path: &str, with_referrers: bool) -> Result<(), String> {
+    let name = oroshi_nix::parse_store_path(store_path)
+        .map(|_| &store_path["/nix/store/".len()..])
+        .map_err(|error| format!("invalid store path: {error}"))?;
+    let _lock = lock(&config.storage.dir)?;
+    let database =
+        Database::open_existing(&config.storage.dir).map_err(|error| error.to_string())?;
+    let referrers =
+        database
+            .drop_narinfo(store_path, with_referrers)
+            .map_err(|error| match error {
+                oroshi_store::DatabaseError::Referenced(..) if !with_referrers => {
+                    format!("{error} (drop them too with --with-referrers)")
+                }
+                _ => error.to_string(),
+            })?;
+    tracing::info!(event = "narinfo-dropped", name, referrers);
+    Ok(())
 }

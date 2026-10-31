@@ -98,13 +98,28 @@ impl State {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with(args, &[])
+    }
+
+    /// `args --config <config> rest`.
+    fn run_with(&self, args: &[&str], rest: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_oroshi"))
             .env_remove("RUST_LOG")
             .args(args)
             .arg("--config")
             .arg(&self.config)
+            .args(rest)
             .output()
             .unwrap()
+    }
+
+    fn drop(&self, path: u32, with_referrers: bool) -> Output {
+        let path = store_path(path);
+        if with_referrers {
+            self.run_with(&["nix", "drop"], &["--with-referrers", &path])
+        } else {
+            self.run_with(&["nix", "drop"], &[&path])
+        }
     }
 }
 
@@ -216,4 +231,96 @@ fn gc_refuses_another_schema_version_without_creating_or_migrating() {
     assert!(line["err"].as_str().unwrap().contains("schema version 0"));
     assert_eq!(std::fs::read(root.join("db/oroshi.sqlite")).unwrap(), b"");
     assert!(!root.join("LAYOUT").exists());
+}
+
+fn one_line(output: &Output) -> serde_json::Value {
+    let lines = log_lines(output);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    lines[0].clone()
+}
+
+fn refused(output: &Output) -> String {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let line = one_line(output);
+    assert_eq!(
+        (&line["event"], &line["level"]),
+        (&"fatal".into(), &"error".into())
+    );
+    line["err"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_dropped_path_can_be_uploaded_again_with_another_nar() {
+    let state = state("");
+    let first = state.add(1, &[1], now(), 10);
+    let output = state.drop(1, false);
+    assert!(output.status.success(), "{output:?}");
+    let line = one_line(&output);
+    assert_eq!(line["event"], "narinfo-dropped");
+    assert_eq!(line["level"], "info");
+    assert_eq!(line["name"], store_path(1)["/nix/store/".len()..]);
+    assert_eq!(line["referrers"], 0);
+    assert!(state.paths().is_empty());
+    // The NAR and blob are left to the sweep.
+    assert!(state.blob_exists(&first));
+    let second = state.add_nar(1, &[], now(), b"another NAR");
+    assert_ne!(first, second);
+    let content = state
+        .handles()
+        .1
+        .narinfo(&format!("{:032}", 1))
+        .unwrap()
+        .unwrap();
+    assert!(
+        content.contains(&oroshi_nix::encode_base32(&second)),
+        "{content}"
+    );
+}
+
+#[test]
+fn a_referenced_path_drops_only_with_its_referrers() {
+    let state = state("");
+    state.add(1, &[1], now(), 10);
+    state.add(2, &[1], now(), 10);
+    state.add(3, &[2], now(), 10);
+    state.add(4, &[], now(), 10);
+    let err = refused(&state.drop(1, false));
+    assert!(
+        err.contains(&store_path(2)) && err.contains("--with-referrers"),
+        "{err}"
+    );
+    assert_eq!(state.paths().len(), 4);
+    let output = state.drop(1, true);
+    assert!(output.status.success(), "{output:?}");
+    let line = one_line(&output);
+    assert_eq!(line["event"], "narinfo-dropped");
+    assert_eq!(line["referrers"], 2);
+    assert_eq!(state.paths(), [store_path(4)]);
+}
+
+#[test]
+fn rooted_absent_or_locked_drops_are_refused_without_dropping() {
+    let state = state("");
+    state.add(1, &[], now(), 10);
+    state.add(2, &[1], now(), 10);
+    let (_, database) = state.handles();
+    database
+        .set_root("release", &[store_path(2)].into())
+        .unwrap();
+    let err = refused(&state.drop(1, true));
+    assert!(
+        err.contains(&format!("{} (root release)", store_path(2))),
+        "{err}"
+    );
+    let err = refused(&state.drop(2, false));
+    assert!(err.contains("root release"), "{err}");
+    assert!(refused(&state.drop(9, false)).contains("no narinfo"));
+    let lock = std::fs::File::create(state.root.join("gc.lock")).unwrap();
+    lock.try_lock().unwrap();
+    assert!(database.delete_root("release").unwrap());
+    assert!(refused(&state.drop(2, false)).contains("gc lock"));
+    drop(lock);
+    assert_eq!(state.paths(), [store_path(1), store_path(2)]);
+    assert!(state.drop(2, false).status.success());
+    assert_eq!(state.paths(), [store_path(1)]);
 }

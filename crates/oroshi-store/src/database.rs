@@ -48,8 +48,14 @@ pub enum DatabaseError {
     Io(io::Error),
     Sqlite(rusqlite::Error),
     InvalidStorePath(ParseError),
-    UnsupportedSchema { found: i64, supported: usize },
-    SchemaMismatch { found: i64, expected: usize },
+    UnsupportedSchema {
+        found: i64,
+        supported: usize,
+    },
+    SchemaMismatch {
+        found: i64,
+        expected: usize,
+    },
     WriterPoisoned,
     NarinfoConflict,
     MissingReference,
@@ -59,6 +65,12 @@ pub enum DatabaseError {
     FileSizeMismatch,
     NarinfoTooLarge,
     InvalidNarinfo(ParseError),
+    /// `drop_narinfo`: the path has no narinfo.
+    AbsentPath,
+    /// `drop_narinfo`: other narinfos reference the path (a sample of them, and their count).
+    Referenced(Vec<String>, usize),
+    /// `drop_narinfo`: roots hold these paths, as `<store path> (root <name>)`, and their count.
+    Rooted(Vec<String>, usize),
 }
 
 impl fmt::Display for DatabaseError {
@@ -88,6 +100,17 @@ impl fmt::Display for DatabaseError {
             Self::NarinfoTooLarge => f.write_str("merged narinfo exceeds the size cap"),
             Self::InvalidNarinfo(error) => write!(f, "invalid stored narinfo: {error}"),
             Self::WriterPoisoned => f.write_str("database writer lock poisoned"),
+            Self::AbsentPath => f.write_str("store path has no narinfo"),
+            Self::Referenced(paths, count) => {
+                write!(
+                    f,
+                    "referenced by {count} other narinfos: {}",
+                    paths.join(", ")
+                )
+            }
+            Self::Rooted(paths, count) => {
+                write!(f, "held by {count} root entries: {}", paths.join(", "))
+            }
         }
     }
 }
@@ -355,6 +378,74 @@ impl Database {
                     .map_err(missing_reference)?;
             }
             Ok(())
+        })
+    }
+
+    /// Drop a narinfo and its outgoing edges in one transaction (ADR 0026); its NAR and blob
+    /// are left to the GC sweep. Refused when another narinfo references it, unless
+    /// `with_referrers`, which drops its transitive referrers too; refused when any dropped
+    /// path is rooted. Returns the number of referrers dropped.
+    pub fn drop_narinfo(
+        &self,
+        store_path: &str,
+        with_referrers: bool,
+    ) -> Result<usize, DatabaseError> {
+        // Refusals name at most this many paths: a closure can hold thousands.
+        const SAMPLE: usize = 10;
+        self.write(|transaction| {
+            let column = |sql: &str| -> Result<Vec<String>, DatabaseError> {
+                Ok(transaction
+                    .prepare(sql)?
+                    .query_map([store_path], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?)
+            };
+            if column("SELECT store_path FROM narinfo WHERE store_path = ?1")?.is_empty() {
+                return Err(DatabaseError::AbsentPath);
+            }
+            let dropped = if with_referrers {
+                column(
+                    "WITH RECURSIVE up(path) AS (
+                         SELECT ?1
+                         UNION SELECT referrer FROM reference JOIN up ON reference = up.path
+                     ) SELECT path FROM up",
+                )?
+            } else {
+                let referrers = column(
+                    "SELECT referrer FROM reference WHERE reference = ?1 AND referrer != ?1
+                     ORDER BY referrer",
+                )?;
+                if !referrers.is_empty() {
+                    let count = referrers.len();
+                    return Err(DatabaseError::Referenced(
+                        referrers.into_iter().take(SAMPLE).collect(),
+                        count,
+                    ));
+                }
+                vec![store_path.to_owned()]
+            };
+            let mut rooted = Vec::new();
+            for path in &dropped {
+                let mut names = transaction
+                    .prepare_cached("SELECT name FROM root WHERE store_path = ?1 ORDER BY name")?;
+                for name in names.query_map([path], |row| row.get::<_, String>(0))? {
+                    rooted.push(format!("{path} (root {})", name?));
+                }
+            }
+            if !rooted.is_empty() {
+                rooted.sort();
+                let count = rooted.len();
+                rooted.truncate(SAMPLE);
+                return Err(DatabaseError::Rooted(rooted, count));
+            }
+            // The set is closed under referrers: once its outgoing edges are gone, nothing
+            // references its narinfos.
+            for path in &dropped {
+                transaction.execute("DELETE FROM reference WHERE referrer = ?1", [path])?;
+            }
+            for path in &dropped {
+                transaction.execute("DELETE FROM narinfo WHERE store_path = ?1", [path])?;
+            }
+            Ok(dropped.len() - 1)
         })
     }
 

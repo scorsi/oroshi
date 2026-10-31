@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path> | oroshi gc --config <path>";
+const USAGE: &str = "usage: oroshi --version | oroshi token hash | oroshi config check [--config] <path> | oroshi serve --config <path> | oroshi gc --config <path> | oroshi nix drop --config <path> [--with-referrers] <store-path>";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -22,6 +22,11 @@ enum Command {
     ConfigCheck(PathBuf),
     Serve(PathBuf),
     Gc(PathBuf),
+    NixDrop {
+        config: PathBuf,
+        store_path: String,
+        with_referrers: bool,
+    },
 }
 
 fn command(args: &[OsString]) -> Result<Command, &'static str> {
@@ -33,6 +38,20 @@ fn command(args: &[OsString]) -> Result<Command, &'static str> {
             Ok(Command::Serve(path.into()))
         }
         [gc, flag, path] if gc == "gc" && flag == "--config" => Ok(Command::Gc(path.into())),
+        [nix, drop, flag, config, rest @ ..]
+            if nix == "nix" && drop == "drop" && flag == "--config" =>
+        {
+            let (with_referrers, store_path) = match rest {
+                [store_path] => (false, store_path),
+                [option, store_path] if option == "--with-referrers" => (true, store_path),
+                _ => return Err(USAGE),
+            };
+            Ok(Command::NixDrop {
+                config: config.into(),
+                store_path: store_path.to_str().ok_or(USAGE)?.to_owned(),
+                with_referrers,
+            })
+        }
         [config, check, path] if config == "config" && check == "check" && path != "--config" => {
             Ok(Command::ConfigCheck(path.into()))
         }
@@ -54,7 +73,10 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
         }
     };
     let path = match &cmd {
-        Command::ConfigCheck(path) | Command::Serve(path) | Command::Gc(path) => path,
+        Command::ConfigCheck(path)
+        | Command::Serve(path)
+        | Command::Gc(path)
+        | Command::NixDrop { config: path, .. } => path,
         Command::Help => {
             println!("{USAGE}");
             return Ok(ExitCode::SUCCESS);
@@ -114,6 +136,14 @@ async fn run(args: &[OsString]) -> Result<ExitCode, String> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        Command::NixDrop {
+            store_path,
+            with_referrers,
+            ..
+        } => {
+            log::init(&config.log.level)?;
+            gc::drop_narinfo(&config, &store_path, with_referrers)?;
+        }
         _ => {}
     }
     Ok(ExitCode::SUCCESS)
@@ -161,6 +191,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_nix_drop_with_or_without_referrers() {
+        let path = "/nix/store/00000000000000000000000000000000-example";
+        for (args, with_referrers) in [
+            (vec!["nix", "drop", "--config", "example.toml", path], false),
+            (
+                vec![
+                    "nix",
+                    "drop",
+                    "--config",
+                    "example.toml",
+                    "--with-referrers",
+                    path,
+                ],
+                true,
+            ),
+        ] {
+            assert_eq!(
+                parse(&args),
+                Ok(Command::NixDrop {
+                    config: "example.toml".into(),
+                    store_path: path.into(),
+                    with_referrers,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn accepts_config_check_with_positional_or_flagged_path() {
         for args in [
             vec!["config", "check", "example.toml"],
@@ -184,6 +242,17 @@ mod tests {
             vec!["gc"],
             vec!["gc", "file"],
             vec!["gc", "--config", "file", "--dry-run"],
+            vec!["nix", "drop", "--config", "file"],
+            vec!["nix", "drop", "path"],
+            vec!["nix", "drop", "--config", "file", "--dry-run", "path"],
+            vec![
+                "nix",
+                "drop",
+                "--config",
+                "file",
+                "path",
+                "--with-referrers",
+            ],
             vec!["--version", "extra"],
             vec!["config", "check"],
             vec!["config", "check", "--config"],
